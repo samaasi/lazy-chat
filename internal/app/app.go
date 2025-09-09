@@ -38,7 +38,7 @@ type App struct {
 	transferManager *filetransfer.TransferManager
 	notificationMgr *notification.NotificationManager
 	dbManager       *database.Manager
-	messageStorage  storage.MessageStorage
+	sqliteDB        *storage.SQLiteDB
 	groupService    *services.GroupService
 	messageHistory  *services.MessageHistoryService
 	ctx             context.Context
@@ -151,7 +151,7 @@ func New(cfg *config.Config) (*App, error) {
 		transferManager: transferMgr,
 		notificationMgr: notificationMgr,
 		dbManager:       dbManager,
-		messageStorage:  messageStorage,
+		sqliteDB:        sqliteDB,
 		groupService:    groupService,
 		messageHistory:  messageHistory,
 		ctx:             ctx,
