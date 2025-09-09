@@ -5,7 +5,7 @@ import (
 	"net"
 	"time"
 
-	"github.com/lazy-chat/internal/models"
+	"github.com/samaasi/lazy-chat/internal/models"
 )
 
 // PeerDiscovery handles peer discovery functionality
@@ -30,6 +30,8 @@ type NetworkManager interface {
 	ConnectToPeer(ctx context.Context, peerID string) error
 	// SendMessage sends a message to a connected peer
 	SendMessage(peerID, message string) error
+	// SendGroupMessage sends a group message to multiple connected peers
+	SendGroupMessage(peerIDs []string, groupMessage *models.ChatMessage) error
 	// GetConnections returns all active connections
 	GetConnections() map[string]net.Conn
 	// IsConnected checks if connected to a specific peer

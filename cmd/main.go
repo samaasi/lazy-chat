@@ -3,9 +3,9 @@ package main
 import (
 	"log"
 
-	"github.com/lazy-chat/internal/app"
-	"github.com/lazy-chat/internal/config"
-	"github.com/lazy-chat/internal/errors"
+	"github.com/samaasi/lazy-chat/internal/app"
+	"github.com/samaasi/lazy-chat/internal/config"
+	"github.com/samaasi/lazy-chat/internal/errors"
 )
 
 func main() {

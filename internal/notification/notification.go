@@ -6,7 +6,7 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/lazy-chat/internal/errors"
+	"github.com/samaasi/lazy-chat/internal/errors"
 )
 
 // NotificationManager handles OS notifications
@@ -29,7 +29,7 @@ func (nm *NotificationManager) NotifyMessageReceived(sender, message string) err
 
 	title := "New Message - Lazy Chat"
 	body := fmt.Sprintf("From %s: %s", sender, message)
-	
+
 	// Truncate long messages
 	if len(body) > 100 {
 		body = body[:97] + "..."
@@ -93,7 +93,7 @@ func (nm *NotificationManager) sendWindowsNotification(title, body string) error
 	// Escape quotes for PowerShell
 	title = strings.ReplaceAll(title, `"`, `""`)
 	body = strings.ReplaceAll(body, `"`, `""`)
-	
+
 	// Use PowerShell to show a toast notification
 	script := fmt.Sprintf(`
 		[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
@@ -117,7 +117,7 @@ func (nm *NotificationManager) sendWindowsNotification(title, body string) error
 		$notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("Lazy Chat")
 		$notifier.Show($toast)
 	`, title, body)
-	
+
 	cmd := exec.Command("powershell", "-Command", script)
 	err := cmd.Run()
 	if err != nil {
@@ -132,7 +132,7 @@ func (nm *NotificationManager) sendWindowsFallbackNotification(title, body strin
 	// Escape quotes for PowerShell
 	title = strings.ReplaceAll(title, `"`, `""`)
 	body = strings.ReplaceAll(body, `"`, `""`)
-	
+
 	script := fmt.Sprintf(`Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.MessageBox]::Show("%s", "%s", "OK", "Information")`, body, title)
 	cmd := exec.Command("powershell", "-Command", script)
 	return cmd.Run()
@@ -141,9 +141,9 @@ func (nm *NotificationManager) sendWindowsFallbackNotification(title, body strin
 // sendMacNotification sends a notification on macOS using osascript
 func (nm *NotificationManager) sendMacNotification(title, body string) error {
 	// Escape quotes for AppleScript
-	title = strings.ReplaceAll(title, `"`, `\"`) 
+	title = strings.ReplaceAll(title, `"`, `\"`)
 	body = strings.ReplaceAll(body, `"`, `\"`)
-	
+
 	script := fmt.Sprintf(`display notification "%s" with title "%s"`, body, title)
 	cmd := exec.Command("osascript", "-e", script)
 	return cmd.Run()
@@ -155,7 +155,7 @@ func (nm *NotificationManager) sendLinuxNotification(title, body string) error {
 	if _, err := exec.LookPath("notify-send"); err != nil {
 		return errors.Wrap(err, errors.ErrorTypeApplication, "NOTIF002", "notify-send not found - please install libnotify")
 	}
-	
+
 	cmd := exec.Command("notify-send", title, body)
 	return cmd.Run()
 }

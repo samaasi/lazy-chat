@@ -4,8 +4,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/lazy-chat/internal/interfaces"
-	"github.com/lazy-chat/internal/models"
+	"github.com/samaasi/lazy-chat/internal/interfaces"
+	"github.com/samaasi/lazy-chat/internal/models"
 )
 
 // Manager implements the PeerManager interface

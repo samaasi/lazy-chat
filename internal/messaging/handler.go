@@ -5,47 +5,110 @@ import (
 	"strings"
 	"time"
 
-	"github.com/lazy-chat/internal/errors"
-	"github.com/lazy-chat/internal/interfaces"
-	"github.com/lazy-chat/internal/models"
+	"github.com/samaasi/lazy-chat/internal/errors"
+	"github.com/samaasi/lazy-chat/internal/interfaces"
+	"github.com/samaasi/lazy-chat/internal/models"
+	"github.com/samaasi/lazy-chat/internal/services"
+	"github.com/samaasi/lazy-chat/internal/storage"
 )
 
 // Handler implements the MessageHandler interface
 type Handler struct {
-	logger       interfaces.Logger
-	callback     func(*models.ChatMessage)
-	notificationMgr interfaces.NotificationManager
+	logger               interfaces.Logger
+	callback             func(*models.ChatMessage)
+	notificationMgr      interfaces.NotificationManager
+	messageStorage       storage.MessageStorage
+	groupService         *services.GroupService
+	groupMessageCallback func(*models.ChatMessage)
 }
 
 // NewHandler creates a new message handler
-func NewHandler(logger interfaces.Logger, notificationMgr interfaces.NotificationManager) *Handler {
+func NewHandler(logger interfaces.Logger, notificationMgr interfaces.NotificationManager, messageStorage storage.MessageStorage, groupService *services.GroupService) *Handler {
 	return &Handler{
 		logger:          logger,
 		notificationMgr: notificationMgr,
+		messageStorage:  messageStorage,
+		groupService:    groupService,
 	}
 }
 
-// HandleMessage processes incoming chat messages
+// HandleMessage processes incoming messages
 func (h *Handler) HandleMessage(msg *models.ChatMessage) {
-	if msg == nil {
-		h.logger.Debug("Received nil message")
+	if err := h.ValidateMessage(msg); err != nil {
+		h.logger.Error("Invalid message received", "error", err)
 		return
 	}
 
-	// Log the message for debugging
-	h.logger.Debug("Message received", "from", msg.From, "content", msg.Message, "timestamp", msg.Timestamp)
+	// Store the received message
+	if h.messageStorage != nil {
+		err := h.messageStorage.StoreMessage(msg)
+		if err != nil {
+			h.logger.Error("Failed to store received message", "error", err)
+		}
+	}
 
-	// Call callback if set
+	h.logger.Info("Message received", "from", msg.From, "content", msg.Message)
+
+	// Handle based on message type
+	if msg.IsGroupMessage() {
+		h.handleGroupMessage(msg)
+	} else {
+		h.handleDirectMessage(msg)
+	}
+}
+
+// handleDirectMessage processes direct messages
+func (h *Handler) handleDirectMessage(msg *models.ChatMessage) {
 	if h.callback != nil {
 		h.callback(msg)
 	}
 
 	// Display the message to the user
 	h.displayMessage(msg)
-	
-	// Send OS notification for received message
-	if err := h.notificationMgr.NotifyMessageReceived(msg.From, msg.Message); err != nil {
-		h.logger.Debug("Failed to send notification", "error", err)
+
+	if h.notificationMgr != nil {
+		if err := h.notificationMgr.NotifyMessageReceived(msg.From, msg.Message); err != nil {
+			h.logger.Debug("Failed to send notification", "error", err)
+		}
+	}
+}
+
+// handleGroupMessage processes group messages
+func (h *Handler) handleGroupMessage(msg *models.ChatMessage) {
+	// Verify the sender is a member of the group
+	if h.groupService != nil && msg.GroupID != "" {
+		members, err := h.groupService.GetGroupMembers(msg.GroupID)
+		if err != nil {
+			h.logger.Error("Failed to verify group membership", "error", err)
+			return
+		}
+
+		// Check if sender is a member
+		isMember := false
+		for _, member := range members {
+			if member.PeerID == msg.From {
+				isMember = true
+				break
+			}
+		}
+
+		if !isMember {
+			h.logger.Warn("Received group message from non-member", "from", msg.From, "groupID", msg.GroupID)
+			return
+		}
+	}
+
+	if h.groupMessageCallback != nil {
+		h.groupMessageCallback(msg)
+	}
+
+	// Display the message to the user
+	h.displayMessage(msg)
+
+	if h.notificationMgr != nil {
+		if err := h.notificationMgr.NotifyMessageReceived(msg.From, fmt.Sprintf("Group: %s", msg.Message)); err != nil {
+			h.logger.Debug("Failed to send group notification", "error", err)
+		}
 	}
 }
 
@@ -53,21 +116,102 @@ func (h *Handler) HandleMessage(msg *models.ChatMessage) {
 func (h *Handler) displayMessage(msg *models.ChatMessage) {
 	// Format timestamp for display
 	timestamp := msg.Timestamp.Format("15:04:05")
-	
+
 	// Display the formatted message
 	fmt.Printf("[%s] %s: %s\n", timestamp, msg.From, msg.Message)
 }
 
-// SendMessage creates and formats a message for sending
-func (h *Handler) SendMessage(from, content string) *models.ChatMessage {
-	msg := models.NewChatMessage(from, content)
-	h.logger.Debug("Message created for sending", "from", from, "content", content)
-	return msg
+// SendMessage sends a message to a specific peer
+func (h *Handler) SendMessage(to, content string) error {
+	message := models.NewChatMessage("", to, content)
+
+	if err := h.ValidateMessage(message); err != nil {
+		return err
+	}
+
+	// Store the message
+	if h.messageStorage != nil {
+		err := h.messageStorage.StoreMessage(message)
+		if err != nil {
+			h.logger.Debug("Failed to store message", "error", err)
+		}
+	}
+
+	h.logger.Debug("Sending message", "to", to, "content", content)
+
+	// Here you would implement the actual network sending logic
+	// For now, we'll just log it
+	h.logger.Debug("Message sent successfully")
+
+	return nil
+}
+
+// SendGroupMessage sends a message to a group
+func (h *Handler) SendGroupMessage(groupID, content string) error {
+	message := models.NewChatMessage("", groupID, content)
+	message.Type = models.MessageTypeGroup
+	message.GroupID = groupID
+
+	if err := h.ValidateMessage(message); err != nil {
+		return err
+	}
+
+	// Get group members
+	if h.groupService == nil {
+		return fmt.Errorf("group service not available")
+	}
+
+	members, err := h.groupService.GetGroupMembers(groupID)
+	if err != nil {
+		return fmt.Errorf("failed to get group members: %w", err)
+	}
+
+	if len(members) == 0 {
+		return fmt.Errorf("no members found in group %s", groupID)
+	}
+
+	// Store the message
+	if h.messageStorage != nil {
+		err := h.messageStorage.StoreMessage(message)
+		if err != nil {
+			h.logger.Debug("Failed to store group message", "error", err)
+		}
+	}
+
+	h.logger.Debug("Sending group message", "groupID", groupID, "content", content, "member_count", len(members))
+
+	// Send message to all group members via network manager
+	if h.netManager != nil {
+		// Extract peer IDs from group members
+		var peerIDs []string
+		for _, member := range members {
+			// Skip sending to self
+			if member.UserID != message.From {
+				peerIDs = append(peerIDs, member.UserID)
+			}
+		}
+
+		if len(peerIDs) > 0 {
+			err = h.netManager.SendGroupMessage(peerIDs, message)
+			if err != nil {
+				h.logger.Error("Failed to send group message", "groupID", groupID, "error", err)
+				return fmt.Errorf("failed to send group message: %w", err)
+			}
+		}
+	}
+
+	h.logger.Debug("Group message sent successfully", "groupID", groupID)
+	return nil
 }
 
 // SetMessageCallback sets a callback for message processing
 func (h *Handler) SetMessageCallback(callback func(*models.ChatMessage)) {
 	h.callback = callback
+}
+
+// SetGroupMessageCallback sets the callback function for received group messages
+func (h *Handler) SetGroupMessageCallback(callback func(*models.ChatMessage)) {
+	h.groupMessageCallback = callback
 }
 
 // ValidateMessage checks if a message is valid

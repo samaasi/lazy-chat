@@ -14,6 +14,7 @@ const (
 	ErrorTypeMessage     ErrorType = "message"
 	ErrorTypeConfig      ErrorType = "config"
 	ErrorTypeApplication ErrorType = "application"
+	ErrorTypeDatabase    ErrorType = "database"
 )
 
 // AppError represents a structured application error

@@ -9,18 +9,21 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/lazy-chat/internal/cli"
-	"github.com/lazy-chat/internal/config"
-	"github.com/lazy-chat/internal/discovery"
-	"github.com/lazy-chat/internal/errors"
-	"github.com/lazy-chat/internal/filetransfer"
-	"github.com/lazy-chat/internal/interfaces"
-	"github.com/lazy-chat/internal/logger"
-	"github.com/lazy-chat/internal/messaging"
-	"github.com/lazy-chat/internal/network"
-	"github.com/lazy-chat/internal/notification"
-	"github.com/lazy-chat/internal/peer"
-	"github.com/lazy-chat/internal/utils"
+	"github.com/samaasi/lazy-chat/internal/cli"
+	"github.com/samaasi/lazy-chat/internal/config"
+	"github.com/samaasi/lazy-chat/internal/database"
+	"github.com/samaasi/lazy-chat/internal/discovery"
+	"github.com/samaasi/lazy-chat/internal/errors"
+	"github.com/samaasi/lazy-chat/internal/filetransfer"
+	"github.com/samaasi/lazy-chat/internal/interfaces"
+	"github.com/samaasi/lazy-chat/internal/logger"
+	"github.com/samaasi/lazy-chat/internal/messaging"
+	"github.com/samaasi/lazy-chat/internal/network"
+	"github.com/samaasi/lazy-chat/internal/notification"
+	"github.com/samaasi/lazy-chat/internal/peer"
+	"github.com/samaasi/lazy-chat/internal/services"
+	"github.com/samaasi/lazy-chat/internal/storage"
+	"github.com/samaasi/lazy-chat/internal/utils"
 )
 
 // App represents the main application
@@ -34,6 +37,10 @@ type App struct {
 	discovery       interfaces.PeerDiscovery
 	transferManager *filetransfer.TransferManager
 	notificationMgr *notification.NotificationManager
+	dbManager       *database.Manager
+	messageStorage  storage.MessageStorage
+	groupService    *services.GroupService
+	messageHistory  *services.MessageHistoryService
 	ctx             context.Context
 	cancel          context.CancelFunc
 	wg              sync.WaitGroup
@@ -85,8 +92,24 @@ func New(cfg *config.Config) (*App, error) {
 	// Create notification manager
 	notificationMgr := notification.NewNotificationManager(cfg.NotificationsEnabled)
 
-	// Create message handler
-	msgHandler := messaging.NewHandler(log, notificationMgr)
+	// Create database manager and initialize
+	dbConfig := &config.DatabaseConfig{}
+	dbManager := database.NewManager(dbConfig)
+	if err := dbManager.Initialize(); err != nil {
+		return nil, errors.Wrap(err, errors.ErrorTypeDatabase, "DB001", "failed to initialize database")
+	}
+
+	// Create storage instances
+	messageStorage := dbManager.GetMessageStorage()
+	groupStorage := dbManager.GetGroupStorage()
+	inviteStorage := dbManager.GetInviteStorage()
+
+	// Create services
+	groupService := services.NewGroupService(groupStorage, inviteStorage)
+	messageHistory := services.NewMessageHistoryService(messageStorage)
+
+	// Create message handler with storage
+	msgHandler := messaging.NewHandler(log, notificationMgr, messageStorage, groupService)
 
 	// Create file transfer manager with configured download directory
 	downloadDir := cfg.DownloadDir
@@ -113,6 +136,10 @@ func New(cfg *config.Config) (*App, error) {
 		discovery:       discSvc,
 		transferManager: transferMgr,
 		notificationMgr: notificationMgr,
+		dbManager:       dbManager,
+		messageStorage:  messageStorage,
+		groupService:    groupService,
+		messageHistory:  messageHistory,
 		ctx:             ctx,
 		cancel:          cancel,
 	}, nil
@@ -194,7 +221,7 @@ func (a *App) Run() error {
 	}
 
 	// Create CLI interface
-	cliInterface := cli.New(a.peerManager, a.netManager, a.logger, a.config.Username)
+	cliInterface := cli.New(a.peerManager, a.netManager, a.logger, a.config.Username, a.groupService, a.messageHistory, a.msgHandler)
 
 	// Start CLI in a separate goroutine
 	a.wg.Add(1)

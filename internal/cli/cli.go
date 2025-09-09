@@ -10,8 +10,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/lazy-chat/internal/filetransfer"
-	"github.com/lazy-chat/internal/interfaces"
+	"github.com/samaasi/lazy-chat/internal/filetransfer"
+	"github.com/samaasi/lazy-chat/internal/interfaces"
+	"github.com/samaasi/lazy-chat/internal/models"
+	"github.com/samaasi/lazy-chat/internal/services"
 )
 
 // CLI handles command line interface interactions
@@ -22,16 +24,19 @@ type CLI struct {
 	scanner         *bufio.Scanner
 	username        string
 	transferManager *filetransfer.TransferManager
+	groupService    *services.GroupService
+	messageHistory  *services.MessageHistoryService
+	messageHandler  interfaces.MessageHandler
 }
 
 // New creates a new CLI instance
-func New(peerManager interfaces.PeerManager, netManager interfaces.NetworkManager, logger interfaces.Logger, username string) *CLI {
+func New(peerManager interfaces.PeerManager, netManager interfaces.NetworkManager, logger interfaces.Logger, username string, groupService *services.GroupService, messageHistory *services.MessageHistoryService, messageHandler interfaces.MessageHandler) *CLI {
 	// Create downloads directory
 	downloadDir := "downloads"
 	if err := os.MkdirAll(downloadDir, 0755); err != nil {
 		logger.Error("Failed to create downloads directory", "error", err)
 	}
-	
+
 	return &CLI{
 		peerManager:     peerManager,
 		netManager:      netManager,
@@ -39,6 +44,9 @@ func New(peerManager interfaces.PeerManager, netManager interfaces.NetworkManage
 		scanner:         bufio.NewScanner(os.Stdin),
 		username:        username,
 		transferManager: filetransfer.NewTransferManager(downloadDir, logger),
+		groupService:    groupService,
+		messageHistory:  messageHistory,
+		messageHandler:  messageHandler,
 	}
 }
 
@@ -127,6 +135,87 @@ func (c *CLI) handleCommand(ctx context.Context, input string) error {
 	case "/transfers", "/tf":
 		c.showTransfers()
 
+	// Group commands
+	case "/creategroup", "/cg":
+		if len(parts) < 2 {
+			fmt.Println("Usage: /creategroup <name> [description]")
+			return nil
+		}
+		name := parts[1]
+		description := ""
+		if len(parts) > 2 {
+			description = strings.Join(parts[2:], " ")
+		}
+		return c.createGroup(name, description)
+
+	case "/joingroup", "/jg":
+		if len(parts) < 2 {
+			fmt.Println("Usage: /joingroup <group_id>")
+			return nil
+		}
+		return c.joinGroup(parts[1])
+
+	case "/leavegroup", "/lg":
+		if len(parts) < 2 {
+			fmt.Println("Usage: /leavegroup <group_id>")
+			return nil
+		}
+		return c.leaveGroup(parts[1])
+
+	case "/groups", "/g":
+		c.listGroups()
+
+	case "/groupmsg", "/gm":
+		if len(parts) < 3 {
+			fmt.Println("Usage: /groupmsg <group_id> <message>")
+			return nil
+		}
+		groupID := parts[1]
+		message := strings.Join(parts[2:], " ")
+		return c.sendGroupMessage(groupID, message)
+
+	case "/invite", "/inv":
+		if len(parts) < 3 {
+			fmt.Println("Usage: /invite <group_id> <peer_id>")
+			return nil
+		}
+		return c.inviteToGroup(parts[1], parts[2])
+
+	case "/invites", "/invs":
+		c.showPendingInvites()
+
+	case "/accept", "/acc":
+		if len(parts) < 2 {
+			fmt.Println("Usage: /accept <group_id>")
+			return nil
+		}
+		return c.acceptInvite(parts[1])
+
+	case "/decline", "/dec":
+		if len(parts) < 2 {
+			fmt.Println("Usage: /decline <group_id>")
+			return nil
+		}
+		return c.declineInvite(parts[1])
+
+	// Message history commands
+	case "/history", "/hist":
+		if len(parts) < 2 {
+			fmt.Println("Usage: /history <peer_id>")
+			return nil
+		}
+		c.showMessageHistory(parts[1])
+
+	case "/grouphistory", "/gh":
+		if len(parts) < 2 {
+			fmt.Println("Usage: /grouphistory <group_id>")
+			return nil
+		}
+		c.showGroupHistory(parts[1])
+
+	case "/recent", "/r":
+		c.showRecentMessages()
+
 	case "/exit", "/quit", "/q":
 		fmt.Println("Goodbye!")
 		return fmt.Errorf("exit")
@@ -158,6 +247,23 @@ func (c *CLI) printHelp() {
 	fmt.Println("  /transfers, /tf        - Show active file transfers")
 	fmt.Println("  /connections, /conn    - List active connections")
 	fmt.Println("  /status, /st           - Show application status")
+	fmt.Println("")
+	fmt.Println("Group commands:")
+	fmt.Println("  /creategroup, /cg <name> [description] - Create a new group")
+	fmt.Println("  /joingroup, /jg <group_id>             - Join a group")
+	fmt.Println("  /leavegroup, /lg <group_id>            - Leave a group")
+	fmt.Println("  /groups, /g                            - List your groups")
+	fmt.Println("  /groupmsg, /gm <group_id> <message>    - Send group message")
+	fmt.Println("  /invite, /inv <group_id> <peer_id>     - Invite peer to group")
+	fmt.Println("  /invites, /invs                        - Show pending invites")
+	fmt.Println("  /accept, /acc <group_id>               - Accept group invite")
+	fmt.Println("  /decline, /dec <group_id>              - Decline group invite")
+	fmt.Println("")
+	fmt.Println("Message history:")
+	fmt.Println("  /history, /hist <peer_id>              - Show message history")
+	fmt.Println("  /grouphistory, /gh <group_id>          - Show group message history")
+	fmt.Println("  /recent, /r                            - Show recent messages")
+	fmt.Println("")
 	fmt.Println("  /exit, /quit, /q       - Exit the application")
 	fmt.Println()
 }
@@ -330,6 +436,188 @@ func (c *CLI) showTransfers() {
 			progress)
 	}
 	fmt.Println()
+}
+
+// Group command handlers
+func (c *CLI) createGroup(name, description string) error {
+	group, err := c.groupService.CreateGroup(c.username, name, description)
+	if err != nil {
+		fmt.Printf("Failed to create group: %v\n", err)
+		return err
+	}
+	fmt.Printf("Group created successfully! ID: %s\n", group.ID)
+	return nil
+}
+
+func (c *CLI) joinGroup(groupID string) error {
+	err := c.groupService.JoinGroup(groupID, c.username)
+	if err != nil {
+		fmt.Printf("Failed to join group: %v\n", err)
+		return err
+	}
+	fmt.Printf("Successfully joined group %s\n", groupID)
+	return nil
+}
+
+func (c *CLI) leaveGroup(groupID string) error {
+	err := c.groupService.LeaveGroup(groupID, c.username)
+	if err != nil {
+		fmt.Printf("Failed to leave group: %v\n", err)
+		return err
+	}
+	fmt.Printf("Successfully left group %s\n", groupID)
+	return nil
+}
+
+func (c *CLI) listGroups() {
+	groups, err := c.groupService.GetUserGroups(c.username)
+	if err != nil {
+		fmt.Printf("Failed to get groups: %v\n", err)
+		return
+	}
+
+	if len(groups) == 0 {
+		fmt.Println("You are not a member of any groups")
+		return
+	}
+
+	fmt.Println("Your groups:")
+	for _, group := range groups {
+		fmt.Printf("  %s: %s\n", group.ID, group.Name)
+		if group.Description != "" {
+			fmt.Printf("    Description: %s\n", group.Description)
+		}
+		fmt.Printf("    Created: %s\n", group.CreatedAt.Format("2006-01-02 15:04:05"))
+	}
+}
+
+func (c *CLI) sendGroupMessage(groupID, message string) error {
+	msg := &models.Message{
+		SenderID:  c.username,
+		GroupID:   &groupID,
+		Content:   message,
+		Timestamp: time.Now(),
+		Type:      models.MessageTypeGroup,
+	}
+
+	err := c.messageHandler.SendGroupMessage(msg)
+	if err != nil {
+		fmt.Printf("Failed to send group message: %v\n", err)
+		return err
+	}
+	fmt.Printf("Message sent to group %s\n", groupID)
+	return nil
+}
+
+func (c *CLI) inviteToGroup(groupID, peerID string) error {
+	err := c.groupService.InviteToGroup(groupID, c.username, peerID)
+	if err != nil {
+		fmt.Printf("Failed to invite user: %v\n", err)
+		return err
+	}
+	fmt.Printf("Invitation sent to %s for group %s\n", peerID, groupID)
+	return nil
+}
+
+func (c *CLI) showPendingInvites() {
+	invites, err := c.groupService.GetPendingInvites(c.username)
+	if err != nil {
+		fmt.Printf("Failed to get pending invites: %v\n", err)
+		return
+	}
+
+	if len(invites) == 0 {
+		fmt.Println("No pending invites")
+		return
+	}
+
+	fmt.Println("Pending invites:")
+	for _, invite := range invites {
+		fmt.Printf("  Group %s invited by %s\n", invite.GroupID, invite.InviterID)
+		fmt.Printf("    Invited: %s\n", invite.CreatedAt.Format("2006-01-02 15:04:05"))
+	}
+}
+
+func (c *CLI) acceptInvite(groupID string) error {
+	err := c.groupService.AcceptInvite(groupID, c.username)
+	if err != nil {
+		fmt.Printf("Failed to accept invite: %v\n", err)
+		return err
+	}
+	fmt.Printf("Successfully joined group %s\n", groupID)
+	return nil
+}
+
+func (c *CLI) declineInvite(groupID string) error {
+	err := c.groupService.DeclineInvite(groupID, c.username)
+	if err != nil {
+		fmt.Printf("Failed to decline invite: %v\n", err)
+		return err
+	}
+	fmt.Printf("Declined invite to group %s\n", groupID)
+	return nil
+}
+
+// Message history command handlers
+func (c *CLI) showMessageHistory(peerID string) {
+	messages, err := c.messageHistory.GetDirectMessages(c.username, peerID)
+	if err != nil {
+		fmt.Printf("Failed to get message history: %v\n", err)
+		return
+	}
+
+	if len(messages) == 0 {
+		fmt.Printf("No message history with %s\n", peerID)
+		return
+	}
+
+	fmt.Printf("Message history with %s:\n", peerID)
+	for _, msg := range messages {
+		timestamp := msg.Timestamp.Format("2006-01-02 15:04:05")
+		fmt.Printf("[%s] %s: %s\n", timestamp, msg.SenderID, msg.Content)
+	}
+}
+
+func (c *CLI) showGroupHistory(groupID string) {
+	messages, err := c.messageHistory.GetGroupMessages(groupID)
+	if err != nil {
+		fmt.Printf("Failed to get group history: %v\n", err)
+		return
+	}
+
+	if len(messages) == 0 {
+		fmt.Printf("No message history for group %s\n", groupID)
+		return
+	}
+
+	fmt.Printf("Message history for group %s:\n", groupID)
+	for _, msg := range messages {
+		timestamp := msg.Timestamp.Format("2006-01-02 15:04:05")
+		fmt.Printf("[%s] %s: %s\n", timestamp, msg.SenderID, msg.Content)
+	}
+}
+
+func (c *CLI) showRecentMessages() {
+	messages, err := c.messageHistory.GetRecentMessages(c.username, 20)
+	if err != nil {
+		fmt.Printf("Failed to get recent messages: %v\n", err)
+		return
+	}
+
+	if len(messages) == 0 {
+		fmt.Println("No recent messages")
+		return
+	}
+
+	fmt.Println("Recent messages:")
+	for _, msg := range messages {
+		timestamp := msg.Timestamp.Format("2006-01-02 15:04:05")
+		if msg.GroupID != nil {
+			fmt.Printf("[%s] [Group %s] %s: %s\n", timestamp, *msg.GroupID, msg.SenderID, msg.Content)
+		} else {
+			fmt.Printf("[%s] %s: %s\n", timestamp, msg.SenderID, msg.Content)
+		}
+	}
 }
 
 // parseNumber safely parses a string to integer

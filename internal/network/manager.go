@@ -9,37 +9,37 @@ import (
 	"sync"
 	"time"
 
-	"github.com/lazy-chat/internal/errors"
-	"github.com/lazy-chat/internal/interfaces"
-	"github.com/lazy-chat/internal/models"
+	"github.com/samaasi/lazy-chat/internal/errors"
+	"github.com/samaasi/lazy-chat/internal/interfaces"
+	"github.com/samaasi/lazy-chat/internal/models"
 )
 
 // Manager implements the NetworkManager interface
 type Manager struct {
-	port        int
-	username    string
-	logger      interfaces.Logger
-	peerManager interfaces.PeerManager
-	msgHandler  interfaces.MessageHandler
+	port            int
+	username        string
+	logger          interfaces.Logger
+	peerManager     interfaces.PeerManager
+	msgHandler      interfaces.MessageHandler
 	notificationMgr interfaces.NotificationManager
-	listener    net.Listener
-	connections map[string]net.Conn
-	mu          sync.RWMutex
-	ctx         context.Context
-	cancel      context.CancelFunc
-	wg          sync.WaitGroup
+	listener        net.Listener
+	connections     map[string]net.Conn
+	mu              sync.RWMutex
+	ctx             context.Context
+	cancel          context.CancelFunc
+	wg              sync.WaitGroup
 }
 
 // NewManager creates a new network manager
 func NewManager(port int, username string, logger interfaces.Logger, peerManager interfaces.PeerManager, msgHandler interfaces.MessageHandler, notificationMgr interfaces.NotificationManager) *Manager {
 	return &Manager{
-		port:        port,
-		username:    username,
-		logger:      logger,
-		peerManager: peerManager,
-		msgHandler:  msgHandler,
+		port:            port,
+		username:        username,
+		logger:          logger,
+		peerManager:     peerManager,
+		msgHandler:      msgHandler,
 		notificationMgr: notificationMgr,
-		connections: make(map[string]net.Conn),
+		connections:     make(map[string]net.Conn),
 	}
 }
 
@@ -159,6 +159,50 @@ func (m *Manager) SendMessage(peerID, message string) error {
 	}
 
 	m.logger.Debug("Message sent", "peer_id", peerID, "message", message)
+	return nil
+}
+
+// SendGroupMessage sends a group message to multiple connected peers
+func (m *Manager) SendGroupMessage(peerIDs []string, groupMessage *models.ChatMessage) error {
+	if len(peerIDs) == 0 {
+		return errors.New(errors.ErrorTypeMessage, "MSG006", "no peers specified for group message")
+	}
+
+	data, err := json.Marshal(groupMessage)
+	if err != nil {
+		return errors.Wrap(err, errors.ErrorTypeMessage, "MSG007", "failed to marshal group message")
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	var failedPeers []string
+	successCount := 0
+
+	for _, peerID := range peerIDs {
+		conn, exists := m.connections[peerID]
+		if !exists {
+			failedPeers = append(failedPeers, peerID)
+			continue
+		}
+
+		_, err = conn.Write(append(data, '\n'))
+		if err != nil {
+			m.logger.Error("Failed to send group message", "peer_id", peerID, "group_id", groupMessage.GroupID, "error", err)
+			failedPeers = append(failedPeers, peerID)
+			// Remove the failed connection
+			go m.removeConnection(peerID)
+		} else {
+			successCount++
+		}
+	}
+
+	m.logger.Debug("Group message sent", "group_id", groupMessage.GroupID, "success_count", successCount, "failed_count", len(failedPeers))
+
+	if len(failedPeers) > 0 {
+		return errors.New(errors.ErrorTypeNetwork, "NET004", "failed to send group message to some peers").WithContext("failed_peers", failedPeers).WithContext("success_count", successCount)
+	}
+
 	return nil
 }
 
@@ -284,7 +328,7 @@ func (m *Manager) removeConnection(peerID string) {
 		conn.Close()
 		delete(m.connections, peerID)
 		m.logger.Debug("Connection removed", "peer_id", peerID)
-		
+
 		// Send notification for peer disconnection
 		if peer, exists := m.peerManager.GetPeer(peerID); exists {
 			if err := m.notificationMgr.NotifyPeerDisconnected(peer.Username); err != nil {

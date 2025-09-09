@@ -8,10 +8,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/lazy-chat/internal/config"
-	"github.com/lazy-chat/internal/errors"
-	"github.com/lazy-chat/internal/interfaces"
-	"github.com/lazy-chat/internal/models"
+	"github.com/samaasi/lazy-chat/internal/config"
+	"github.com/samaasi/lazy-chat/internal/errors"
+	"github.com/samaasi/lazy-chat/internal/interfaces"
+	"github.com/samaasi/lazy-chat/internal/models"
 )
 
 // Service implements the PeerDiscovery interface

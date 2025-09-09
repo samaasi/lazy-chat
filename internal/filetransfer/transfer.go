@@ -11,9 +11,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/lazy-chat/internal/errors"
-	"github.com/lazy-chat/internal/interfaces"
-	"github.com/lazy-chat/internal/ui"
+	"github.com/samaasi/lazy-chat/internal/errors"
+	"github.com/samaasi/lazy-chat/internal/interfaces"
+	"github.com/samaasi/lazy-chat/internal/ui"
 )
 
 // FileTransferMessage represents a file transfer message
@@ -29,17 +29,17 @@ type FileTransferMessage struct {
 
 // TransferState tracks the state of an ongoing transfer
 type TransferState struct {
-	TransferID        string
-	FileName          string
-	FileSize          int64
-	BytesTransferred  int64
-	Status            string // "pending", "active", "completed", "failed"
-	PeerID            string
-	StartedAt         time.Time
-	CompletedAt       time.Time
-	ReceivedChunks    map[int][]byte
-	TotalChunks       int
-	FileHash          string
+	TransferID       string
+	FileName         string
+	FileSize         int64
+	BytesTransferred int64
+	Status           string // "pending", "active", "completed", "failed"
+	PeerID           string
+	StartedAt        time.Time
+	CompletedAt      time.Time
+	ReceivedChunks   map[int][]byte
+	TotalChunks      int
+	FileHash         string
 }
 
 // TransferManager manages file transfers
@@ -223,10 +223,10 @@ func (tm *TransferManager) handleTransferComplete(peerID string, msg *FileTransf
 	transferState.CompletedAt = time.Now()
 
 	tm.logger.Info("File transfer completed successfully", "transfer_id", transferState.TransferID, "file_path", filePath)
-	
+
 	// Finish progress tracking
 	tm.progressMgr.FinishProgress(transferState.TransferID)
-	
+
 	delete(tm.activeTransfers, transferState.TransferID)
 
 	return nil

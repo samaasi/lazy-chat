@@ -9,23 +9,23 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/lazy-chat/internal/errors"
+	"github.com/samaasi/lazy-chat/internal/errors"
 )
 
 // Config holds all configuration for the P2P chat application
 type Config struct {
-	Username          string `json:"username"`
-	TCPPort           int    `json:"tcp_port"`
-	DiscoveryPort     int    `json:"discovery_port"`
-	BroadcastAddr     string `json:"broadcast_addr"`
-	DiscoveryRange    int    `json:"discovery_range"`
-	BroadcastInterval int    `json:"broadcast_interval"` // seconds
-	LogLevel          string `json:"log_level"`
-	LogFormat         string `json:"log_format"`         // text or json
-	LogFile           string `json:"log_file"`           // empty for stdout only
-	NotificationsEnabled bool `json:"notifications_enabled"`
-	DownloadDir       string `json:"download_dir"`
-	ConfigFile        string `json:"-"` // Not serialized
+	Username             string `json:"username"`
+	TCPPort              int    `json:"tcp_port"`
+	DiscoveryPort        int    `json:"discovery_port"`
+	BroadcastAddr        string `json:"broadcast_addr"`
+	DiscoveryRange       int    `json:"discovery_range"`
+	BroadcastInterval    int    `json:"broadcast_interval"` // seconds
+	LogLevel             string `json:"log_level"`
+	LogFormat            string `json:"log_format"` // text or json
+	LogFile              string `json:"log_file"`   // empty for stdout only
+	NotificationsEnabled bool   `json:"notifications_enabled"`
+	DownloadDir          string `json:"download_dir"`
+	ConfigFile           string `json:"-"` // Not serialized
 }
 
 // LoadConfig loads configuration from all sources in priority order:
@@ -35,37 +35,37 @@ type Config struct {
 // 4. Command line flags
 func LoadConfig() (*Config, error) {
 	cfg := DefaultConfig()
-	
+
 	// Load from config file if specified
 	if err := cfg.LoadFromFile(); err != nil {
 		return nil, err
 	}
-	
+
 	cfg.LoadFromEnv()
 	cfg.LoadFromFlags()
-	
+
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	
+
 	return cfg, nil
 }
 
 // DefaultConfig returns a configuration with sensible defaults
 func DefaultConfig() *Config {
 	return &Config{
-		Username:          "Anonymous",
-		TCPPort:           8080,
-		DiscoveryPort:     9999,
-		BroadcastAddr:     "255.255.255.255",
-		DiscoveryRange:    10,
-		BroadcastInterval: 5,
-		LogLevel:          "info",
-		LogFormat:         "text",
-		LogFile:           "",
+		Username:             "Anonymous",
+		TCPPort:              8080,
+		DiscoveryPort:        9999,
+		BroadcastAddr:        "255.255.255.255",
+		DiscoveryRange:       10,
+		BroadcastInterval:    5,
+		LogLevel:             "info",
+		LogFormat:            "text",
+		LogFile:              "",
 		NotificationsEnabled: true,
-		DownloadDir:       "downloads",
-		ConfigFile:        "",
+		DownloadDir:          "downloads",
+		ConfigFile:           "",
 	}
 }
 
