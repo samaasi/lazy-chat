@@ -14,7 +14,14 @@ import (
 
 func main() {
 	// Load configuration
-	cfg := config.LoadConfig()
+	cfg, err := config.LoadConfig()
+	if err != nil {
+		if appErr, ok := err.(*errors.AppError); ok {
+			log.Fatalf("Failed to load configuration: %s (Code: %s, Type: %s)", appErr.Message, appErr.Code, appErr.Type)
+		} else {
+			log.Fatalf("Failed to load configuration: %v", err)
+		}
+	}
 
 	// Create application instance
 	app, err := app.New(cfg)

@@ -44,10 +44,10 @@ func New(cfg *config.Config) (*App, error) {
 		return nil, errors.Wrap(err, errors.ErrorTypeConfig, "CFG001", "configuration validation failed")
 	}
 
-	// Create logger
-	logLevel, err := logger.ParseLevel("info") // Default to info level
+	// Create logger with configured log level
+	logLevel, err := logger.ParseLevel(cfg.LogLevel)
 	if err != nil {
-		logLevel = logger.InfoLevel
+		logLevel = logger.InfoLevel // Fallback to info level
 	}
 	log := logger.New(logLevel)
 
@@ -63,10 +63,10 @@ func New(cfg *config.Config) (*App, error) {
 	// Create message handler
 	msgHandler := messaging.NewHandler(log)
 
-	// Create file transfer manager
-	downloadDir := "downloads"
+	// Create file transfer manager with configured download directory
+	downloadDir := cfg.DownloadDir
 	if err := os.MkdirAll(downloadDir, 0755); err != nil {
-		log.Error("Failed to create downloads directory", "error", err)
+		log.Error("Failed to create downloads directory", "error", err, "dir", downloadDir)
 	}
 	transferMgr := filetransfer.NewTransferManager(downloadDir, log)
 

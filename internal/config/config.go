@@ -1,40 +1,65 @@
 package config
 
 import (
+	"encoding/json"
 	"flag"
+	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 
 	"github.com/lazy-chat/internal/errors"
 )
 
 // Config holds all configuration for the P2P chat application
 type Config struct {
-	Username        string
-	TCPPort         int
-	DiscoveryPort   int
-	BroadcastAddr   string
-	DiscoveryRange  int
-	BroadcastInterval int // seconds
+	Username          string `json:"username"`
+	TCPPort           int    `json:"tcp_port"`
+	DiscoveryPort     int    `json:"discovery_port"`
+	BroadcastAddr     string `json:"broadcast_addr"`
+	DiscoveryRange    int    `json:"discovery_range"`
+	BroadcastInterval int    `json:"broadcast_interval"` // seconds
+	LogLevel          string `json:"log_level"`
+	DownloadDir       string `json:"download_dir"`
+	ConfigFile        string `json:"-"` // Not serialized
 }
 
-// LoadConfig loads configuration from all sources
-func LoadConfig() *Config {
+// LoadConfig loads configuration from all sources in priority order:
+// 1. Default values
+// 2. Configuration file
+// 3. Environment variables
+// 4. Command line flags
+func LoadConfig() (*Config, error) {
 	cfg := DefaultConfig()
+	
+	// Load from config file if specified
+	if err := cfg.LoadFromFile(); err != nil {
+		return nil, err
+	}
+	
 	cfg.LoadFromEnv()
 	cfg.LoadFromFlags()
-	return cfg
+	
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	
+	return cfg, nil
 }
 
 // DefaultConfig returns a configuration with sensible defaults
 func DefaultConfig() *Config {
 	return &Config{
-		Username:        "Anonymous",
-		TCPPort:         8080,
-		DiscoveryPort:   9999,
-		BroadcastAddr:   "255.255.255.255",
-		DiscoveryRange:  10,
+		Username:          "Anonymous",
+		TCPPort:           8080,
+		DiscoveryPort:     9999,
+		BroadcastAddr:     "255.255.255.255",
+		DiscoveryRange:    10,
 		BroadcastInterval: 5,
+		LogLevel:          "info",
+		DownloadDir:       "downloads",
+		ConfigFile:        "",
 	}
 }
 
@@ -46,27 +71,78 @@ func (c *Config) LoadFromFlags() {
 	flag.StringVar(&c.BroadcastAddr, "broadcast-addr", c.BroadcastAddr, "Broadcast address for discovery")
 	flag.IntVar(&c.DiscoveryRange, "discovery-range", c.DiscoveryRange, "Number of ports to try for discovery")
 	flag.IntVar(&c.BroadcastInterval, "broadcast-interval", c.BroadcastInterval, "Broadcast interval in seconds")
+	flag.StringVar(&c.LogLevel, "log-level", c.LogLevel, "Log level (debug, info, warn, error)")
+	flag.StringVar(&c.DownloadDir, "download-dir", c.DownloadDir, "Directory for downloaded files")
+	flag.StringVar(&c.ConfigFile, "config", c.ConfigFile, "Path to configuration file")
 	flag.Parse()
 }
 
 // LoadFromEnv loads configuration from environment variables
 func (c *Config) LoadFromEnv() {
-	if username := os.Getenv("P2P_USERNAME"); username != "" {
-		c.Username = username
+	envVars := map[string]interface{}{
+		"P2P_USERNAME":           &c.Username,
+		"P2P_TCP_PORT":           &c.TCPPort,
+		"P2P_DISCOVERY_PORT":     &c.DiscoveryPort,
+		"P2P_BROADCAST_ADDR":     &c.BroadcastAddr,
+		"P2P_DISCOVERY_RANGE":    &c.DiscoveryRange,
+		"P2P_BROADCAST_INTERVAL": &c.BroadcastInterval,
+		"P2P_LOG_LEVEL":          &c.LogLevel,
+		"P2P_DOWNLOAD_DIR":       &c.DownloadDir,
+		"P2P_CONFIG_FILE":        &c.ConfigFile,
 	}
-	if port := os.Getenv("P2P_TCP_PORT"); port != "" {
-		if p, err := strconv.Atoi(port); err == nil {
-			c.TCPPort = p
+
+	for envVar, field := range envVars {
+		if value := os.Getenv(envVar); value != "" {
+			switch ptr := field.(type) {
+			case *string:
+				*ptr = value
+			case *int:
+				if intVal, err := strconv.Atoi(value); err == nil {
+					*ptr = intVal
+				}
+			}
 		}
 	}
-	if discoveryPort := os.Getenv("P2P_DISCOVERY_PORT"); discoveryPort != "" {
-		if p, err := strconv.Atoi(discoveryPort); err == nil {
-			c.DiscoveryPort = p
+}
+
+// LoadFromFile loads configuration from a JSON file
+func (c *Config) LoadFromFile() error {
+	if c.ConfigFile == "" {
+		return nil // No config file specified
+	}
+
+	data, err := os.ReadFile(c.ConfigFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // Config file doesn't exist, use defaults
 		}
+		return errors.ErrConfigInvalid.WithContext("file", c.ConfigFile).WithContext("error", err.Error())
 	}
-	if broadcastAddr := os.Getenv("P2P_BROADCAST_ADDR"); broadcastAddr != "" {
-		c.BroadcastAddr = broadcastAddr
+
+	if err := json.Unmarshal(data, c); err != nil {
+		return errors.ErrConfigInvalid.WithContext("file", c.ConfigFile).WithContext("error", err.Error())
 	}
+
+	return nil
+}
+
+// SaveToFile saves the current configuration to a JSON file
+func (c *Config) SaveToFile(filename string) error {
+	data, err := json.MarshalIndent(c, "", "  ")
+	if err != nil {
+		return errors.ErrConfigInvalid.WithContext("error", err.Error())
+	}
+
+	dir := filepath.Dir(filename)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return errors.ErrConfigInvalid.WithContext("dir", dir).WithContext("error", err.Error())
+	}
+
+	if err := os.WriteFile(filename, data, 0644); err != nil {
+		return errors.ErrConfigInvalid.WithContext("file", filename).WithContext("error", err.Error())
+	}
+
+	return nil
 }
 
 // Validate checks if the configuration is valid
@@ -80,5 +156,36 @@ func (c *Config) Validate() error {
 	if c.Username == "" {
 		return errors.ErrConfigValidation.WithContext("field", "username").WithContext("reason", "empty")
 	}
+	if c.DiscoveryRange < 1 || c.DiscoveryRange > 100 {
+		return errors.ErrConfigValidation.WithContext("field", "discovery_range").WithContext("value", c.DiscoveryRange)
+	}
+	if c.BroadcastInterval < 1 || c.BroadcastInterval > 300 {
+		return errors.ErrConfigValidation.WithContext("field", "broadcast_interval").WithContext("value", c.BroadcastInterval)
+	}
+
+	// Validate log level
+	validLogLevels := []string{"debug", "info", "warn", "error"}
+	validLevel := false
+	for _, level := range validLogLevels {
+		if strings.ToLower(c.LogLevel) == level {
+			validLevel = true
+			break
+		}
+	}
+	if !validLevel {
+		return errors.ErrConfigValidation.WithContext("field", "log_level").WithContext("value", c.LogLevel)
+	}
+
+	// Validate download directory
+	if c.DownloadDir == "" {
+		return errors.ErrConfigValidation.WithContext("field", "download_dir").WithContext("reason", "empty")
+	}
+
 	return nil
+}
+
+// String returns a string representation of the configuration
+func (c *Config) String() string {
+	return fmt.Sprintf("Config{Username: %s, TCPPort: %d, DiscoveryPort: %d, LogLevel: %s, DownloadDir: %s}",
+		c.Username, c.TCPPort, c.DiscoveryPort, c.LogLevel, c.DownloadDir)
 }
