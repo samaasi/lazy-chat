@@ -1,6 +1,7 @@
 package messaging
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
@@ -20,15 +21,19 @@ type Handler struct {
 	messageStorage       storage.MessageStorage
 	groupService         *services.GroupService
 	groupMessageCallback func(*models.ChatMessage)
+	idGenerator          interfaces.IDGenerator
+	netManager           interfaces.NetworkManager
 }
 
 // NewHandler creates a new message handler
-func NewHandler(logger interfaces.Logger, notificationMgr interfaces.NotificationManager, messageStorage storage.MessageStorage, groupService *services.GroupService) *Handler {
+func NewHandler(logger interfaces.Logger, notificationMgr interfaces.NotificationManager, messageStorage storage.MessageStorage, groupService *services.GroupService, idGenerator interfaces.IDGenerator, netManager interfaces.NetworkManager) *Handler {
 	return &Handler{
 		logger:          logger,
 		notificationMgr: notificationMgr,
 		messageStorage:  messageStorage,
 		groupService:    groupService,
+		idGenerator:     idGenerator,
+		netManager:      netManager,
 	}
 }
 
@@ -41,7 +46,7 @@ func (h *Handler) HandleMessage(msg *models.ChatMessage) {
 
 	// Store the received message
 	if h.messageStorage != nil {
-		err := h.messageStorage.StoreMessage(msg)
+		err := h.messageStorage.SaveMessage(context.Background(), msg)
 		if err != nil {
 			h.logger.Error("Failed to store received message", "error", err)
 		}
@@ -123,7 +128,7 @@ func (h *Handler) displayMessage(msg *models.ChatMessage) {
 
 // SendMessage sends a message to a specific peer
 func (h *Handler) SendMessage(to, content string) error {
-	message := models.NewChatMessage("", to, content)
+	message := models.NewChatMessage(h.idGenerator.GeneratePoeticID(), "", to, content)
 
 	if err := h.ValidateMessage(message); err != nil {
 		return err
@@ -131,7 +136,7 @@ func (h *Handler) SendMessage(to, content string) error {
 
 	// Store the message
 	if h.messageStorage != nil {
-		err := h.messageStorage.StoreMessage(message)
+		err := h.messageStorage.SaveMessage(context.Background(), message)
 		if err != nil {
 			h.logger.Debug("Failed to store message", "error", err)
 		}
@@ -148,7 +153,7 @@ func (h *Handler) SendMessage(to, content string) error {
 
 // SendGroupMessage sends a message to a group
 func (h *Handler) SendGroupMessage(groupID, content string) error {
-	message := models.NewChatMessage("", groupID, content)
+	message := models.NewChatMessage(h.idGenerator.GeneratePoeticID(), "", groupID, content)
 	message.Type = models.MessageTypeGroup
 	message.GroupID = groupID
 
@@ -172,7 +177,7 @@ func (h *Handler) SendGroupMessage(groupID, content string) error {
 
 	// Store the message
 	if h.messageStorage != nil {
-		err := h.messageStorage.StoreMessage(message)
+		err := h.messageStorage.SaveMessage(context.Background(), message)
 		if err != nil {
 			h.logger.Debug("Failed to store group message", "error", err)
 		}
@@ -186,8 +191,8 @@ func (h *Handler) SendGroupMessage(groupID, content string) error {
 		var peerIDs []string
 		for _, member := range members {
 			// Skip sending to self
-			if member.UserID != message.From {
-				peerIDs = append(peerIDs, member.UserID)
+			if member.PeerID != message.From {
+				peerIDs = append(peerIDs, member.PeerID)
 			}
 		}
 

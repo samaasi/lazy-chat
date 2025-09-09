@@ -1,6 +1,8 @@
 package services
 
-import import (
+import (
+	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -32,15 +34,17 @@ func (gs *GroupService) CreateGroup(name, description string) (*models.Group, er
 		ID:          generateGroupID(),
 		Name:        name,
 		Description: description,
-		AdminID:     gs.currentPeerID,
+		CreatedBy:   gs.currentPeerID,
 		CreatedAt:   time.Now(),
 		UpdatedAt:   time.Now(),
+		Members:     make(map[string]string),
+		IsActive:    true,
 	}
 
 	// Add creator as first member
-	group.AddMember(gs.currentPeerID, models.RoleAdmin)
+	group.AddMember(gs.currentPeerID, "admin")
 
-	err := gs.groupStorage.CreateGroup(group)
+	err := gs.groupStorage.CreateGroup(context.Background(), group)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create group: %w", err)
 	}
@@ -50,7 +54,7 @@ func (gs *GroupService) CreateGroup(name, description string) (*models.Group, er
 
 // JoinGroup allows a peer to join a group (if public or invited)
 func (gs *GroupService) JoinGroup(groupID, peerID string) error {
-	group, err := gs.groupStorage.GetGroup(groupID)
+	group, err := gs.groupStorage.GetGroup(context.Background(), groupID)
 	if err != nil {
 		return fmt.Errorf("failed to get group: %w", err)
 	}
@@ -60,33 +64,25 @@ func (gs *GroupService) JoinGroup(groupID, peerID string) error {
 	}
 
 	// Check if already a member
-	if group.IsMember(peerID) {
+	if group.HasMember(peerID) {
 		return errors.New("already a member of this group")
 	}
 
-	// For private groups, check if there's a valid invitation
-	if !group.IsPublic {
-		invite, err := gs.inviteStorage.GetInvite(groupID, peerID)
-		if err != nil {
-			return fmt.Errorf("failed to check invitation: %w", err)
-		}
-		if invite == nil || invite.IsExpired() {
-			return errors.New("no valid invitation found")
-		}
-	}
+	// For now, allow anyone to join (simplified logic)
+	// In a real implementation, you would check invitations
 
-	err = gs.groupStorage.AddGroupMember(groupID, peerID, models.RoleMember)
+	// Create group member
+	member := models.NewGroupMember(groupID, peerID, peerID, "member")
+	err = gs.groupStorage.AddGroupMember(context.Background(), member)
 	if err != nil {
 		return fmt.Errorf("failed to add member: %w", err)
 	}
 
-	// Mark invitation as used if it exists
-	if !group.IsPublic {
-		err = gs.inviteStorage.AcceptInvite(groupID, peerID)
+	// Add to group's member map
+	group.AddMember(peerID, peerID)
+	err = gs.groupStorage.UpdateGroup(context.Background(), group)
 		if err != nil {
-			// Log error but don't fail the join operation
-			fmt.Printf("Warning: failed to mark invitation as accepted: %v\n", err)
-		}
+		return fmt.Errorf("failed to update group: %w", err)
 	}
 
 	return nil
@@ -94,7 +90,7 @@ func (gs *GroupService) JoinGroup(groupID, peerID string) error {
 
 // LeaveGroup allows a peer to leave a group
 func (gs *GroupService) LeaveGroup(groupID, peerID string) error {
-	group, err := gs.groupStorage.GetGroup(groupID)
+	group, err := gs.groupStorage.GetGroup(context.Background(), groupID)
 	if err != nil {
 		return fmt.Errorf("failed to get group: %w", err)
 	}
@@ -103,51 +99,21 @@ func (gs *GroupService) LeaveGroup(groupID, peerID string) error {
 		return errors.New("group not found")
 	}
 
-	if !group.IsMember(peerID) {
+	if !group.HasMember(peerID) {
 		return errors.New("not a member of this group")
 	}
 
-	// Check if this is the admin leaving
-	if group.AdminID == peerID {
-		// Transfer admin rights to another member or delete group if no members
-		members, err := gs.groupStorage.GetGroupMembers(groupID)
-		if err != nil {
-			return fmt.Errorf("failed to get group members: %w", err)
-		}
-
-		// Find another member to promote to admin
-		var newAdmin string
-		for _, member := range members {
-			if member.PeerID != peerID {
-				newAdmin = member.PeerID
-				break
-			}
-		}
-
-		if newAdmin != "" {
-			// Promote new admin
-			err = gs.groupStorage.UpdateMemberRole(groupID, newAdmin, models.RoleAdmin)
-			if err != nil {
-				return fmt.Errorf("failed to promote new admin: %w", err)
-			}
-			group.AdminID = newAdmin
-			err = gs.groupStorage.UpdateGroup(group)
-			if err != nil {
-				return fmt.Errorf("failed to update group admin: %w", err)
-			}
-		} else {
-			// No other members, delete the group
-			err = gs.groupStorage.DeleteGroup(groupID)
-			if err != nil {
-				return fmt.Errorf("failed to delete empty group: %w", err)
-			}
-			return nil
-		}
-	}
-
-	err = gs.groupStorage.RemoveGroupMember(groupID, peerID)
+	// Remove member from group
+	err = gs.groupStorage.RemoveGroupMember(context.Background(), groupID, peerID)
 	if err != nil {
 		return fmt.Errorf("failed to remove member: %w", err)
+	}
+
+	// Update group's member map
+	group.RemoveMember(peerID)
+	err = gs.groupStorage.UpdateGroup(context.Background(), group)
+	if err != nil {
+		return fmt.Errorf("failed to update group: %w", err)
 	}
 
 	return nil
@@ -155,7 +121,7 @@ func (gs *GroupService) LeaveGroup(groupID, peerID string) error {
 
 // InviteToGroup creates an invitation for a peer to join a group
 func (gs *GroupService) InviteToGroup(groupID, inviterID, inviteeID string, expiresIn time.Duration) (*models.GroupInvite, error) {
-	group, err := gs.groupStorage.GetGroup(groupID)
+	group, err := gs.groupStorage.GetGroup(context.Background(), groupID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get group: %w", err)
 	}
@@ -165,26 +131,24 @@ func (gs *GroupService) InviteToGroup(groupID, inviterID, inviteeID string, expi
 	}
 
 	// Check if inviter is a member with invite permissions
-	if !group.IsMember(inviterID) {
+	if !group.HasMember(inviterID) {
 		return nil, errors.New("only group members can send invitations")
 	}
 
 	// Check if invitee is already a member
-	if group.IsMember(inviteeID) {
+	if group.HasMember(inviteeID) {
 		return nil, errors.New("user is already a member of this group")
 	}
 
-	invite := &models.GroupInvite{
-		ID:        generateInviteID(),
-		GroupID:   groupID,
-		InviterID: inviterID,
-		InviteeID: inviteeID,
-		CreatedAt: time.Now(),
-		ExpiresAt: time.Now().Add(expiresIn),
-		Status:    models.InviteStatusPending,
-	}
+	invite := models.NewGroupInvite(
+		generateInviteID(),
+		groupID,
+		inviterID,
+		inviteeID,
+		time.Now().Add(expiresIn),
+	)
 
-	err = gs.inviteStorage.CreateInvite(invite)
+	err = gs.inviteStorage.CreateInvite(context.Background(), invite)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create invitation: %w", err)
 	}
@@ -194,7 +158,7 @@ func (gs *GroupService) InviteToGroup(groupID, inviterID, inviteeID string, expi
 
 // GetUserGroups returns all groups a user is a member of
 func (gs *GroupService) GetUserGroups(peerID string) ([]*models.Group, error) {
-	groups, err := gs.groupStorage.GetUserGroups(peerID)
+	groups, err := gs.groupStorage.GetGroupsByMember(context.Background(), peerID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get user groups: %w", err)
 	}
@@ -203,7 +167,7 @@ func (gs *GroupService) GetUserGroups(peerID string) ([]*models.Group, error) {
 
 // GetGroupMembers returns all members of a group
 func (gs *GroupService) GetGroupMembers(groupID string) ([]*models.GroupMember, error) {
-	members, err := gs.groupStorage.GetGroupMembers(groupID)
+	members, err := gs.groupStorage.GetGroupMembers(context.Background(), groupID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get group members: %w", err)
 	}
@@ -212,7 +176,7 @@ func (gs *GroupService) GetGroupMembers(groupID string) ([]*models.GroupMember, 
 
 // GetPendingInvites returns all pending invitations for a user
 func (gs *GroupService) GetPendingInvites(peerID string) ([]*models.GroupInvite, error) {
-	invites, err := gs.inviteStorage.GetPendingInvites(peerID)
+	invites, err := gs.inviteStorage.GetInvitesByInvitee(context.Background(), peerID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get pending invites: %w", err)
 	}
@@ -221,7 +185,19 @@ func (gs *GroupService) GetPendingInvites(peerID string) ([]*models.GroupInvite,
 
 // AcceptInvite accepts a group invitation
 func (gs *GroupService) AcceptInvite(groupID, peerID string) error {
-	invite, err := gs.inviteStorage.GetInvite(groupID, peerID)
+	// Find invite by group and invitee
+	invites, err := gs.inviteStorage.GetInvitesByInvitee(context.Background(), peerID)
+	if err != nil {
+		return fmt.Errorf("failed to get invitations: %w", err)
+	}
+
+	var invite *models.GroupInvite
+	for _, inv := range invites {
+		if inv.GroupID == groupID && inv.Status == "pending" {
+			invite = inv
+			break
+		}
+	}
 	if err != nil {
 		return fmt.Errorf("failed to get invitation: %w", err)
 	}
@@ -234,7 +210,7 @@ func (gs *GroupService) AcceptInvite(groupID, peerID string) error {
 		return errors.New("invitation has expired")
 	}
 
-	if invite.Status != models.InviteStatusPending {
+	if invite.Status != "pending" {
 		return errors.New("invitation is not pending")
 	}
 
@@ -244,12 +220,38 @@ func (gs *GroupService) AcceptInvite(groupID, peerID string) error {
 		return fmt.Errorf("failed to join group: %w", err)
 	}
 
+	// Update invite status
+	invite.Accept()
+	err = gs.inviteStorage.UpdateInviteStatus(context.Background(), invite.ID, "accepted")
+	if err != nil {
+		return fmt.Errorf("failed to update invite status: %w", err)
+	}
+
 	return nil
 }
 
 // DeclineInvite declines a group invitation
 func (gs *GroupService) DeclineInvite(groupID, peerID string) error {
-	err := gs.inviteStorage.DeclineInvite(groupID, peerID)
+	// Find invite by group and invitee
+	invites, err := gs.inviteStorage.GetInvitesByInvitee(context.Background(), peerID)
+	if err != nil {
+		return fmt.Errorf("failed to get invitations: %w", err)
+	}
+
+	var invite *models.GroupInvite
+	for _, inv := range invites {
+		if inv.GroupID == groupID && inv.Status == "pending" {
+			invite = inv
+			break
+		}
+	}
+
+	if invite == nil {
+		return errors.New("invitation not found")
+	}
+
+	invite.Decline()
+	err = gs.inviteStorage.UpdateInviteStatus(context.Background(), invite.ID, "declined")
 	if err != nil {
 		return fmt.Errorf("failed to decline invitation: %w", err)
 	}

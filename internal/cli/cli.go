@@ -12,6 +12,7 @@ import (
 
 	"github.com/samaasi/lazy-chat/internal/filetransfer"
 	"github.com/samaasi/lazy-chat/internal/interfaces"
+	"github.com/samaasi/lazy-chat/internal/messaging"
 	"github.com/samaasi/lazy-chat/internal/models"
 	"github.com/samaasi/lazy-chat/internal/services"
 )
@@ -440,7 +441,7 @@ func (c *CLI) showTransfers() {
 
 // Group command handlers
 func (c *CLI) createGroup(name, description string) error {
-	group, err := c.groupService.CreateGroup(c.username, name, description)
+	group, err := c.groupService.CreateGroup(name, description)
 	if err != nil {
 		fmt.Printf("Failed to create group: %v\n", err)
 		return err
@@ -492,25 +493,42 @@ func (c *CLI) listGroups() {
 }
 
 func (c *CLI) sendGroupMessage(groupID, message string) error {
-	msg := &models.Message{
-		SenderID:  c.username,
-		GroupID:   &groupID,
-		Content:   message,
-		Timestamp: time.Now(),
-		Type:      models.MessageTypeGroup,
-	}
-
-	err := c.messageHandler.SendGroupMessage(msg)
+	// Use network manager to send group message
+	// First get group members
+	groups, err := c.groupService.GetUserGroups(c.username)
 	if err != nil {
-		fmt.Printf("Failed to send group message: %v\n", err)
+		fmt.Printf("Failed to get groups: %v\n", err)
 		return err
 	}
-	fmt.Printf("Message sent to group %s\n", groupID)
+
+	// Find the target group
+	var targetGroup *models.Group
+	for _, group := range groups {
+		if group.ID == groupID {
+			targetGroup = group
+			break
+		}
+	}
+
+	if targetGroup == nil {
+		fmt.Printf("Group %s not found\n", groupID)
+		return fmt.Errorf("group not found")
+	}
+
+	// Send the message through the message handler
+	if handler, ok := c.messageHandler.(*messaging.Handler); ok {
+		err = handler.SendGroupMessage(groupID, message)
+		if err != nil {
+			fmt.Printf("Failed to send group message: %v\n", err)
+			return err
+		}
+	}
+	fmt.Printf("[Group %s] %s: %s\n", groupID, c.username, message)
 	return nil
 }
 
 func (c *CLI) inviteToGroup(groupID, peerID string) error {
-	err := c.groupService.InviteToGroup(groupID, c.username, peerID)
+	_, err := c.groupService.InviteToGroup(groupID, c.username, peerID, 24*time.Hour) // 24 hour expiry
 	if err != nil {
 		fmt.Printf("Failed to invite user: %v\n", err)
 		return err
@@ -560,7 +578,7 @@ func (c *CLI) declineInvite(groupID string) error {
 
 // Message history command handlers
 func (c *CLI) showMessageHistory(peerID string) {
-	messages, err := c.messageHistory.GetDirectMessages(c.username, peerID)
+	messages, err := c.messageHistory.GetDirectMessageHistory(c.username, peerID, 50, 0)
 	if err != nil {
 		fmt.Printf("Failed to get message history: %v\n", err)
 		return
@@ -574,12 +592,12 @@ func (c *CLI) showMessageHistory(peerID string) {
 	fmt.Printf("Message history with %s:\n", peerID)
 	for _, msg := range messages {
 		timestamp := msg.Timestamp.Format("2006-01-02 15:04:05")
-		fmt.Printf("[%s] %s: %s\n", timestamp, msg.SenderID, msg.Content)
+		fmt.Printf("[%s] %s: %s\n", timestamp, msg.From, msg.Message)
 	}
 }
 
 func (c *CLI) showGroupHistory(groupID string) {
-	messages, err := c.messageHistory.GetGroupMessages(groupID)
+	messages, err := c.messageHistory.GetGroupMessageHistory(groupID, 50, 0)
 	if err != nil {
 		fmt.Printf("Failed to get group history: %v\n", err)
 		return
@@ -593,7 +611,7 @@ func (c *CLI) showGroupHistory(groupID string) {
 	fmt.Printf("Message history for group %s:\n", groupID)
 	for _, msg := range messages {
 		timestamp := msg.Timestamp.Format("2006-01-02 15:04:05")
-		fmt.Printf("[%s] %s: %s\n", timestamp, msg.SenderID, msg.Content)
+		fmt.Printf("[%s] %s: %s\n", timestamp, msg.From, msg.Message)
 	}
 }
 
@@ -612,10 +630,10 @@ func (c *CLI) showRecentMessages() {
 	fmt.Println("Recent messages:")
 	for _, msg := range messages {
 		timestamp := msg.Timestamp.Format("2006-01-02 15:04:05")
-		if msg.GroupID != nil {
-			fmt.Printf("[%s] [Group %s] %s: %s\n", timestamp, *msg.GroupID, msg.SenderID, msg.Content)
+		if msg.GroupID != "" {
+			fmt.Printf("[%s] [Group %s] %s: %s\n", timestamp, msg.GroupID, msg.From, msg.Message)
 		} else {
-			fmt.Printf("[%s] %s: %s\n", timestamp, msg.SenderID, msg.Content)
+			fmt.Printf("[%s] %s: %s\n", timestamp, msg.From, msg.Message)
 		}
 	}
 }

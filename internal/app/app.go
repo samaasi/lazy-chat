@@ -100,16 +100,24 @@ func New(cfg *config.Config) (*App, error) {
 	}
 
 	// Create storage instances
-	messageStorage := dbManager.GetMessageStorage()
-	groupStorage := dbManager.GetGroupStorage()
-	inviteStorage := dbManager.GetInviteStorage()
+	sqliteDB, err := dbManager.CreateStorageInstances()
+	if err != nil {
+		log.Fatal("Failed to create storage instances", "error", err)
+	}
+
+	// Connect to database
+	if err := sqliteDB.Connect(context.Background()); err != nil {
+		log.Fatal("Failed to connect to database", "error", err)
+	}
+
+	// Run migrations
+	if err := sqliteDB.Migrate(context.Background()); err != nil {
+		log.Fatal("Failed to run database migrations", "error", err)
+	}
 
 	// Create services
-	groupService := services.NewGroupService(groupStorage, inviteStorage)
-	messageHistory := services.NewMessageHistoryService(messageStorage)
-
-	// Create message handler with storage
-	msgHandler := messaging.NewHandler(log, notificationMgr, messageStorage, groupService)
+	groupService := services.NewGroupService(sqliteDB, sqliteDB, peerID)
+	messageHistory := services.NewMessageHistoryService(sqliteDB, sqliteDB)
 
 	// Create file transfer manager with configured download directory
 	downloadDir := cfg.DownloadDir
@@ -118,8 +126,14 @@ func New(cfg *config.Config) (*App, error) {
 	}
 	transferMgr := filetransfer.NewTransferManager(downloadDir, log)
 
-	// Create network manager
-	netMgr := network.NewManager(cfg.TCPPort, cfg.Username, log, peerMgr, msgHandler, notificationMgr)
+	// Create network manager first (without message handler)
+	netMgr := network.NewManager(cfg.TCPPort, cfg.Username, log, peerMgr, nil, notificationMgr, idGen)
+
+	// Create message handler with storage and network manager
+	msgHandler := messaging.NewHandler(log, notificationMgr, sqliteDB, groupService, idGen, netMgr)
+
+	// Set the message handler in network manager
+	netMgr.SetMessageHandler(msgHandler)
 
 	// Create discovery service
 	discSvc := discovery.NewService(cfg, log, peerMgr, peerID, cfg.Username, cfg.TCPPort)

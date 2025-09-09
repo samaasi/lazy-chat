@@ -9,9 +9,7 @@ import (
 	"github.com/samaasi/lazy-chat/internal/config"
 	"github.com/samaasi/lazy-chat/internal/storage"
 
-	_ "github.com/mattn/go-sqlite3" // SQLite driver
-	// _ "github.com/lib/pq"           // PostgreSQL driver
-	// _ "github.com/go-sql-driver/mysql" // MySQL driver
+	_ "github.com/mattn/go-sqlite3"
 )
 
 // Manager handles database connections and initialization
@@ -76,12 +74,12 @@ func (m *Manager) Close() error {
 }
 
 // CreateStorageInstances creates storage instances using the database connection
-func (m *Manager) CreateStorageInstances() (*storage.SQLiteStorage, error) {
+func (m *Manager) CreateStorageInstances() (*storage.SQLiteDB, error) {
 	if m.db == nil {
 		return nil, fmt.Errorf("database not initialized")
 	}
 
-	sqliteStorage := storage.NewSQLiteStorage(m.db)
+	sqliteStorage := storage.NewSQLiteDB(m.config.GetConnectionString())
 	return sqliteStorage, nil
 }
 

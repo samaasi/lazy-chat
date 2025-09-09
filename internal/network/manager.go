@@ -22,6 +22,7 @@ type Manager struct {
 	peerManager     interfaces.PeerManager
 	msgHandler      interfaces.MessageHandler
 	notificationMgr interfaces.NotificationManager
+	idGenerator     interfaces.IDGenerator
 	listener        net.Listener
 	connections     map[string]net.Conn
 	mu              sync.RWMutex
@@ -31,7 +32,7 @@ type Manager struct {
 }
 
 // NewManager creates a new network manager
-func NewManager(port int, username string, logger interfaces.Logger, peerManager interfaces.PeerManager, msgHandler interfaces.MessageHandler, notificationMgr interfaces.NotificationManager) *Manager {
+func NewManager(port int, username string, logger interfaces.Logger, peerManager interfaces.PeerManager, msgHandler interfaces.MessageHandler, notificationMgr interfaces.NotificationManager, idGenerator interfaces.IDGenerator) *Manager {
 	return &Manager{
 		port:            port,
 		username:        username,
@@ -39,8 +40,16 @@ func NewManager(port int, username string, logger interfaces.Logger, peerManager
 		peerManager:     peerManager,
 		msgHandler:      msgHandler,
 		notificationMgr: notificationMgr,
+		idGenerator:     idGenerator,
 		connections:     make(map[string]net.Conn),
 	}
+}
+
+// SetMessageHandler sets the message handler for the network manager
+func (m *Manager) SetMessageHandler(msgHandler interfaces.MessageHandler) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.msgHandler = msgHandler
 }
 
 // Start begins listening for incoming connections
@@ -144,7 +153,7 @@ func (m *Manager) SendMessage(peerID, message string) error {
 		return errors.ErrPeerNotConnected.WithContext("peer_id", peerID)
 	}
 
-	chatMsg := models.NewChatMessage(m.username, message)
+	chatMsg := models.NewChatMessage(m.idGenerator.GeneratePoeticID(), m.username, peerID, message)
 	data, err := json.Marshal(chatMsg)
 	if err != nil {
 		return errors.Wrap(err, errors.ErrorTypeMessage, "MSG005", "failed to marshal message").WithContext("peer_id", peerID)
