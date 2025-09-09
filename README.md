@@ -222,8 +222,8 @@ Run with debug logging for detailed information:
 
 ## 🔮 Roadmap
 
-- [ ] Group chat support
-- [ ] Message history persistence
+- [x] Group chat support
+- [x] Message history persistence
 - [ ] End-to-end encryption
 - [ ] Web interface
 - [ ] Mobile applications
