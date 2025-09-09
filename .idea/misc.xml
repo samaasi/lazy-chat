@@ -1,0 +1,108 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="ErlangCompilerOptions">
+    <useRebarCompiler>true</useRebarCompiler>
+  </component>
+  <component name="GoImports">
+    <option name="excludedPackages">
+      <array>
+        <option value="http" />
+      </array>
+    </option>
+  </component>
+  <component name="GoVcsConfiguration">
+    <option name="GO_FMT" value="false" />
+  </component>
+  <component name="KubernetesApiProvider">{}</component>
+  <component name="Make.Settings">
+    <option name="useCygwin" value="true" />
+  </component>
+  <component name="ProjectInspectionProfilesVisibleTreeState">
+    <entry key="Project Default">
+      <profile-state>
+        <expanded-state>
+          <State />
+          <State>
+            <id>Android</id>
+          </State>
+          <State>
+            <id>Class structureJava</id>
+          </State>
+          <State>
+            <id>Code maturityJava</id>
+          </State>
+          <State>
+            <id>Compiler issuesJava</id>
+          </State>
+          <State>
+            <id>InteroperabilityLintAndroid</id>
+          </State>
+          <State>
+            <id>JVM languages</id>
+          </State>
+          <State>
+            <id>Java</id>
+          </State>
+          <State>
+            <id>Java 5Java language level migration aidsJava</id>
+          </State>
+          <State>
+            <id>Java 8Java language level migration aidsJava</id>
+          </State>
+          <State>
+            <id>Java language level migration aidsJava</id>
+          </State>
+          <State>
+            <id>JavadocJava</id>
+          </State>
+          <State>
+            <id>LintAndroid</id>
+          </State>
+          <State>
+            <id>Numeric issuesJava</id>
+          </State>
+          <State>
+            <id>PerformanceJava</id>
+          </State>
+          <State>
+            <id>Spring</id>
+          </State>
+          <State>
+            <id>Spring AOPSpring</id>
+          </State>
+          <State>
+            <id>Test frameworksJVM languages</id>
+          </State>
+          <State>
+            <id>TestNGJava</id>
+          </State>
+          <State>
+            <id>Threading issuesJava</id>
+          </State>
+        </expanded-state>
+        <selected-state>
+          <State>
+            <id>Android</id>
+          </State>
+        </selected-state>
+      </profile-state>
+    </entry>
+  </component>
+  <component name="ProjectRootManager" version="2" languageLevel="JDK_X" default="true" project-jdk-name="Erlang 26.1.2" project-jdk-type="Erlang SDK">
+    <output url="file://$PROJECT_DIR$/out" />
+  </component>
+  <component name="RSettings">
+    <option name="interpreterPath" value="C:\Program Files\R\R-4.4.1\bin\R.exe" />
+    <option name="loadWorkspace" value="true" />
+    <option name="saveWorkspace" value="true" />
+  </component>
+  <component name="RebarSettings">
+    <rebarPath>C:\Program Files\Erlang OTP\bin\rebar3</rebarPath>
+  </component>
+  <component name="RustProjectSettings">
+    <option name="toolchainHomeDirectory" value="$USER_HOME$/.cargo/bin" />
+  </component>
+  <component name="TailwindSettings">
+    <option name="lspConfiguration" value="{&#10;  &quot;includeLanguages&quot;: {&#10;    &quot;ftl&quot;: &quot;html&quot;,&#10;    &quot;jinja&quot;: &quot;html&quot;,&#10;    &quot;jinja2&quot;: &quot;html&quot;,&#10;    &quot;smarty&quot;: &quot;html&quot;,&#10;    &quot;tmpl&quot;: &quot;gohtml&quot;,&#10;    &quot;cshtml&quot;: &quot;html&quot;,&#10;    &quot;vbhtml&quot;: &quot;html&quot;,&#10;    &quot;razor&quot;: &quot;html&quot;,&#10;    &quot;blade&quot;: &quot;html&quot;,&#10;    &quot;typescript&quot;: &quot;html&quot;&#10;  },&#10;  &quot;files&quot;: {&#10;    &quot;exclude&quot;: [&#10;      &quot;**/.git/**&quot;,&#10;      &quot;**/node_modules/**&quot;,&#10;      &quot;**/.hg/**&quot;,&#10;      &quot;**/.svn/**&quot;&#10;    ]&#10;  },&#10;  &quot;emmetCompletions&quot;: false,&#10;  &quot;classAttributes&quot;: [&quot;class&quot;, &quot;className&quot;, &quot;ngClass&quot;],&#10;  &quot;colorDecorators&quot;: true,&#10;  &quot;showPixelEquivalents&quot;: true,&#10;  &quot;rootFontSize&quot;: 16,&#10;  &quot;hovers&quot;: true,&#10;  &quot;suggestions&quot;: true,&#10;  &quot;codeActions&quot;: true,&#10;  &quot;validate&quot;: true,&#10;  &quot;lint&quot;: {&#10;    &quot;invalidScreen&quot;: &quot;error&quot;,&#10;    &quot;invalidVariant&quot;: &quot;error&quot;,&#10;    &quot;invalidTailwindDirective&quot;: &quot;error&quot;,&#10;    &quot;invalidApply&quot;: &quot;error&quot;,&#10;    &quot;invalidConfigPath&quot;: &quot;error&quot;,&#10;    &quot;cssConflict&quot;: &quot;warning&quot;,&#10;    &quot;recommendedVariantOrder&quot;: &quot;warning&quot;&#10;  },&#10;  &quot;experimental&quot;: {&#10;    &quot;configFile&quot;: null,&#10;    &quot;classRegex&quot;: []&#10;  }&#10;}" />
+  </component>
+</project>
