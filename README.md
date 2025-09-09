@@ -41,7 +41,7 @@ go build -o lazy-chat ./cmd
 
 ## 📋 Requirements
 
-- **Go**: 1.21 or later (for building from source)
+- **Go**: 1.24 or later (for building from source)
 - **Operating System**: Windows, macOS, or Linux
 - **Network**: Local network access for peer discovery
 
@@ -126,7 +126,7 @@ internal/
 
 ### Prerequisites
 
-- Go 1.21+
+- Go 1.24+
 - Git
 
 ### Setup Development Environment
