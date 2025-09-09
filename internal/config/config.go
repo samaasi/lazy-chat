@@ -21,6 +21,8 @@ type Config struct {
 	DiscoveryRange    int    `json:"discovery_range"`
 	BroadcastInterval int    `json:"broadcast_interval"` // seconds
 	LogLevel          string `json:"log_level"`
+	LogFormat         string `json:"log_format"`         // text or json
+	LogFile           string `json:"log_file"`           // empty for stdout only
 	DownloadDir       string `json:"download_dir"`
 	ConfigFile        string `json:"-"` // Not serialized
 }
@@ -58,6 +60,8 @@ func DefaultConfig() *Config {
 		DiscoveryRange:    10,
 		BroadcastInterval: 5,
 		LogLevel:          "info",
+		LogFormat:         "text",
+		LogFile:           "",
 		DownloadDir:       "downloads",
 		ConfigFile:        "",
 	}
@@ -72,6 +76,8 @@ func (c *Config) LoadFromFlags() {
 	flag.IntVar(&c.DiscoveryRange, "discovery-range", c.DiscoveryRange, "Number of ports to try for discovery")
 	flag.IntVar(&c.BroadcastInterval, "broadcast-interval", c.BroadcastInterval, "Broadcast interval in seconds")
 	flag.StringVar(&c.LogLevel, "log-level", c.LogLevel, "Log level (debug, info, warn, error)")
+	flag.StringVar(&c.LogFormat, "log-format", c.LogFormat, "Log format (text, json)")
+	flag.StringVar(&c.LogFile, "log-file", c.LogFile, "Log file path (empty for stdout only)")
 	flag.StringVar(&c.DownloadDir, "download-dir", c.DownloadDir, "Directory for downloaded files")
 	flag.StringVar(&c.ConfigFile, "config", c.ConfigFile, "Path to configuration file")
 	flag.Parse()
@@ -87,6 +93,8 @@ func (c *Config) LoadFromEnv() {
 		"P2P_DISCOVERY_RANGE":    &c.DiscoveryRange,
 		"P2P_BROADCAST_INTERVAL": &c.BroadcastInterval,
 		"P2P_LOG_LEVEL":          &c.LogLevel,
+		"P2P_LOG_FORMAT":         &c.LogFormat,
+		"P2P_LOG_FILE":           &c.LogFile,
 		"P2P_DOWNLOAD_DIR":       &c.DownloadDir,
 		"P2P_CONFIG_FILE":        &c.ConfigFile,
 	}
@@ -174,6 +182,19 @@ func (c *Config) Validate() error {
 	}
 	if !validLevel {
 		return errors.ErrConfigValidation.WithContext("field", "log_level").WithContext("value", c.LogLevel)
+	}
+
+	// Validate log format
+	validLogFormats := []string{"text", "json"}
+	validFormat := false
+	for _, format := range validLogFormats {
+		if strings.ToLower(c.LogFormat) == format {
+			validFormat = true
+			break
+		}
+	}
+	if !validFormat {
+		return errors.ErrConfigValidation.WithContext("field", "log_format").WithContext("value", c.LogFormat)
 	}
 
 	// Validate download directory
