@@ -64,7 +64,7 @@ func DefaultConfig() *Config {
 		LogLevel:             "info",
 		LogFormat:            "text",
 		LogFile:              "",
-		NotificationsEnabled: true,
+		NotificationsEnabled: false,
 		DownloadDir:          "downloads",
 		Database:             DefaultDatabaseConfig(),
 		ConfigFile:           "",
