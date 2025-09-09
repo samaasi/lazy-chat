@@ -93,8 +93,7 @@ func New(cfg *config.Config) (*App, error) {
 	notificationMgr := notification.NewNotificationManager(cfg.NotificationsEnabled)
 
 	// Create database manager and initialize
-	dbConfig := &config.DatabaseConfig{}
-	dbManager := database.NewManager(dbConfig)
+	dbManager := database.NewManager(cfg.Database)
 	if err := dbManager.Initialize(); err != nil {
 		return nil, errors.Wrap(err, errors.ErrorTypeDatabase, "DB001", "failed to initialize database")
 	}

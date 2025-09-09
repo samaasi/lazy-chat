@@ -1,0 +1,15 @@
+{
+  "username": "TestUser",
+  "tcp_port": 8080,
+  "discovery_port": 9999,
+  "broadcast_addr": "255.255.255.255",
+  "discovery_range": 10,
+  "broadcast_interval": 5,
+  "log_level": "info",
+  "download_dir": "downloads",
+  "database": {
+    "type": "sqlite",
+    "path": "./lazy-chat.db",
+    "migrate": true
+  }
+}

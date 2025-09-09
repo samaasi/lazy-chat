@@ -14,18 +14,19 @@ import (
 
 // Config holds all configuration for the P2P chat application
 type Config struct {
-	Username             string `json:"username"`
-	TCPPort              int    `json:"tcp_port"`
-	DiscoveryPort        int    `json:"discovery_port"`
-	BroadcastAddr        string `json:"broadcast_addr"`
-	DiscoveryRange       int    `json:"discovery_range"`
-	BroadcastInterval    int    `json:"broadcast_interval"` // seconds
-	LogLevel             string `json:"log_level"`
-	LogFormat            string `json:"log_format"` // text or json
-	LogFile              string `json:"log_file"`   // empty for stdout only
-	NotificationsEnabled bool   `json:"notifications_enabled"`
-	DownloadDir          string `json:"download_dir"`
-	ConfigFile           string `json:"-"` // Not serialized
+	Username             string          `json:"username"`
+	TCPPort              int             `json:"tcp_port"`
+	DiscoveryPort        int             `json:"discovery_port"`
+	BroadcastAddr        string          `json:"broadcast_addr"`
+	DiscoveryRange       int             `json:"discovery_range"`
+	BroadcastInterval    int             `json:"broadcast_interval"` // seconds
+	LogLevel             string          `json:"log_level"`
+	LogFormat            string          `json:"log_format"` // text or json
+	LogFile              string          `json:"log_file"`   // empty for stdout only
+	NotificationsEnabled bool            `json:"notifications_enabled"`
+	DownloadDir          string          `json:"download_dir"`
+	Database             *DatabaseConfig `json:"database"`
+	ConfigFile           string          `json:"-"` // Not serialized
 }
 
 // LoadConfig loads configuration from all sources in priority order:
@@ -65,6 +66,7 @@ func DefaultConfig() *Config {
 		LogFile:              "",
 		NotificationsEnabled: true,
 		DownloadDir:          "downloads",
+		Database:             DefaultDatabaseConfig(),
 		ConfigFile:           "",
 	}
 }
