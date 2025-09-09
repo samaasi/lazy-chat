@@ -222,9 +222,9 @@ Run with debug logging for detailed information:
 
 ## 🔮 Roadmap
 
-- [ ] End-to-end encryption
 - [ ] Group chat support
 - [ ] Message history persistence
+- [ ] End-to-end encryption
 - [ ] Web interface
 - [ ] Mobile applications
 - [ ] Plugin system
