@@ -119,6 +119,7 @@ var (
 	ErrAppAlreadyRunning  = New(ErrorTypeApplication, "APP003", "application is already running")
 	ErrAppNotRunning      = New(ErrorTypeApplication, "APP004", "application is not running")
 	ErrAppInitFailed      = New(ErrorTypeApplication, "APP005", "application initialization failed")
+	ErrAppShutdownTimeout = New(ErrorTypeApplication, "APP006", "shutdown timeout exceeded")
 )
 
 // File Transfer Error Definitions

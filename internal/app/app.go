@@ -147,21 +147,39 @@ func (a *App) Stop() error {
 	// Cancel context to signal all services to stop
 	a.cancel()
 
-	// Stop discovery service
-	if err := a.discovery.Stop(); err != nil {
-		a.logger.Error("Error stopping discovery service", "error", err)
+	// Create a timeout context for graceful shutdown
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer shutdownCancel()
+
+	// Channel to signal when shutdown is complete
+	shutdownDone := make(chan struct{})
+
+	go func() {
+		defer close(shutdownDone)
+
+		// Stop discovery service
+		if err := a.discovery.Stop(); err != nil {
+			a.logger.Error("Error stopping discovery service", "error", err)
+		}
+
+		// Stop network manager
+		if err := a.netManager.Stop(); err != nil {
+			a.logger.Error("Error stopping network manager", "error", err)
+		}
+
+		// Wait for all goroutines to finish
+		a.wg.Wait()
+	}()
+
+	// Wait for graceful shutdown or timeout
+	select {
+	case <-shutdownDone:
+		a.logger.Info("Application stopped successfully")
+		return nil
+	case <-shutdownCtx.Done():
+		a.logger.Warn("Graceful shutdown timed out, forcing exit")
+		return errors.New(errors.ErrorTypeApplication, "APP006", "shutdown timeout exceeded")
 	}
-
-	// Stop network manager
-	if err := a.netManager.Stop(); err != nil {
-		a.logger.Error("Error stopping network manager", "error", err)
-	}
-
-	// Wait for all goroutines to finish
-	a.wg.Wait()
-
-	a.logger.Info("Application stopped successfully")
-	return nil
 }
 
 // Run starts the application and handles graceful shutdown
