@@ -56,6 +56,22 @@ type PeerManager interface {
 	CleanupStalePeers(threshold time.Duration)
 }
 
+// NotificationManager handles OS notifications
+type NotificationManager interface {
+	// NotifyMessageReceived sends a notification for received messages
+	NotifyMessageReceived(sender, message string) error
+	// NotifyFileReceived sends a notification for received files
+	NotifyFileReceived(sender, filename string) error
+	// NotifyPeerConnected sends a notification when a peer connects
+	NotifyPeerConnected(peerName string) error
+	// NotifyPeerDisconnected sends a notification when a peer disconnects
+	NotifyPeerDisconnected(peerName string) error
+	// SetEnabled enables or disables notifications
+	SetEnabled(enabled bool)
+	// IsEnabled returns whether notifications are enabled
+	IsEnabled() bool
+}
+
 // Logger defines logging interface
 type Logger interface {
 	Debug(msg string, keysAndValues ...interface{})

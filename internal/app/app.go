@@ -82,8 +82,11 @@ func New(cfg *config.Config) (*App, error) {
 	// Create peer manager
 	peerMgr := peer.NewManager(log)
 
+	// Create notification manager
+	notificationMgr := notification.NewNotificationManager(cfg.NotificationsEnabled)
+
 	// Create message handler
-	msgHandler := messaging.NewHandler(log)
+	msgHandler := messaging.NewHandler(log, notificationMgr)
 
 	// Create file transfer manager with configured download directory
 	downloadDir := cfg.DownloadDir
@@ -92,11 +95,8 @@ func New(cfg *config.Config) (*App, error) {
 	}
 	transferMgr := filetransfer.NewTransferManager(downloadDir, log)
 
-	// Create notification manager
-	notificationMgr := notification.NewNotificationManager(true) // Enable notifications by default
-
 	// Create network manager
-	netMgr := network.NewManager(cfg.TCPPort, cfg.Username, log, peerMgr, msgHandler)
+	netMgr := network.NewManager(cfg.TCPPort, cfg.Username, log, peerMgr, msgHandler, notificationMgr)
 
 	// Create discovery service
 	discSvc := discovery.NewService(cfg, log, peerMgr, peerID, cfg.Username, cfg.TCPPort)

@@ -8,21 +8,20 @@ import (
 	"github.com/lazy-chat/internal/errors"
 	"github.com/lazy-chat/internal/interfaces"
 	"github.com/lazy-chat/internal/models"
-	"github.com/lazy-chat/internal/notification"
 )
 
 // Handler implements the MessageHandler interface
 type Handler struct {
 	logger       interfaces.Logger
 	callback     func(*models.ChatMessage)
-	notificationMgr *notification.NotificationManager
+	notificationMgr interfaces.NotificationManager
 }
 
 // NewHandler creates a new message handler
-func NewHandler(logger interfaces.Logger) *Handler {
+func NewHandler(logger interfaces.Logger, notificationMgr interfaces.NotificationManager) *Handler {
 	return &Handler{
 		logger:          logger,
-		notificationMgr: notification.NewNotificationManager(true), // Enable notifications by default
+		notificationMgr: notificationMgr,
 	}
 }
 

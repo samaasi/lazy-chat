@@ -23,6 +23,7 @@ type Config struct {
 	LogLevel          string `json:"log_level"`
 	LogFormat         string `json:"log_format"`         // text or json
 	LogFile           string `json:"log_file"`           // empty for stdout only
+	NotificationsEnabled bool `json:"notifications_enabled"`
 	DownloadDir       string `json:"download_dir"`
 	ConfigFile        string `json:"-"` // Not serialized
 }
@@ -62,6 +63,7 @@ func DefaultConfig() *Config {
 		LogLevel:          "info",
 		LogFormat:         "text",
 		LogFile:           "",
+		NotificationsEnabled: true,
 		DownloadDir:       "downloads",
 		ConfigFile:        "",
 	}
@@ -78,6 +80,7 @@ func (c *Config) LoadFromFlags() {
 	flag.StringVar(&c.LogLevel, "log-level", c.LogLevel, "Log level (debug, info, warn, error)")
 	flag.StringVar(&c.LogFormat, "log-format", c.LogFormat, "Log format (text, json)")
 	flag.StringVar(&c.LogFile, "log-file", c.LogFile, "Log file path (empty for stdout only)")
+	flag.BoolVar(&c.NotificationsEnabled, "notifications", c.NotificationsEnabled, "Enable OS notifications")
 	flag.StringVar(&c.DownloadDir, "download-dir", c.DownloadDir, "Directory for downloaded files")
 	flag.StringVar(&c.ConfigFile, "config", c.ConfigFile, "Path to configuration file")
 	flag.Parse()
@@ -95,6 +98,7 @@ func (c *Config) LoadFromEnv() {
 		"P2P_LOG_LEVEL":          &c.LogLevel,
 		"P2P_LOG_FORMAT":         &c.LogFormat,
 		"P2P_LOG_FILE":           &c.LogFile,
+		"P2P_NOTIFICATIONS":      &c.NotificationsEnabled,
 		"P2P_DOWNLOAD_DIR":       &c.DownloadDir,
 		"P2P_CONFIG_FILE":        &c.ConfigFile,
 	}
@@ -107,6 +111,10 @@ func (c *Config) LoadFromEnv() {
 			case *int:
 				if intVal, err := strconv.Atoi(value); err == nil {
 					*ptr = intVal
+				}
+			case *bool:
+				if boolVal, err := strconv.ParseBool(value); err == nil {
+					*ptr = boolVal
 				}
 			}
 		}

@@ -21,6 +21,7 @@ type Manager struct {
 	logger      interfaces.Logger
 	peerManager interfaces.PeerManager
 	msgHandler  interfaces.MessageHandler
+	notificationMgr interfaces.NotificationManager
 	listener    net.Listener
 	connections map[string]net.Conn
 	mu          sync.RWMutex
@@ -30,13 +31,14 @@ type Manager struct {
 }
 
 // NewManager creates a new network manager
-func NewManager(port int, username string, logger interfaces.Logger, peerManager interfaces.PeerManager, msgHandler interfaces.MessageHandler) *Manager {
+func NewManager(port int, username string, logger interfaces.Logger, peerManager interfaces.PeerManager, msgHandler interfaces.MessageHandler, notificationMgr interfaces.NotificationManager) *Manager {
 	return &Manager{
 		port:        port,
 		username:    username,
 		logger:      logger,
 		peerManager: peerManager,
 		msgHandler:  msgHandler,
+		notificationMgr: notificationMgr,
 		connections: make(map[string]net.Conn),
 	}
 }
@@ -119,6 +121,11 @@ func (m *Manager) ConnectToPeer(ctx context.Context, peerID string) error {
 
 	m.connections[peerID] = conn
 	m.logger.Info("Connected to peer", "peer_id", peerID, "username", peer.Username, "address", peer.NetworkAddress())
+
+	// Send notification for peer connection
+	if err := m.notificationMgr.NotifyPeerConnected(peer.Username); err != nil {
+		m.logger.Debug("Failed to send peer connected notification", "error", err)
+	}
 
 	// Start handling messages from this connection
 	m.wg.Add(1)
@@ -259,6 +266,13 @@ func (m *Manager) handleConnection(peerID string, conn net.Conn) {
 	}
 
 	m.logger.Info("Connection to peer closed", "peer_id", peerID)
+
+	// Send notification for peer disconnection
+	if peer, exists := m.peerManager.GetPeer(peerID); exists {
+		if err := m.notificationMgr.NotifyPeerDisconnected(peer.Username); err != nil {
+			m.logger.Debug("Failed to send peer disconnected notification", "error", err)
+		}
+	}
 }
 
 // removeConnection safely removes a connection
@@ -270,5 +284,12 @@ func (m *Manager) removeConnection(peerID string) {
 		conn.Close()
 		delete(m.connections, peerID)
 		m.logger.Debug("Connection removed", "peer_id", peerID)
+		
+		// Send notification for peer disconnection
+		if peer, exists := m.peerManager.GetPeer(peerID); exists {
+			if err := m.notificationMgr.NotifyPeerDisconnected(peer.Username); err != nil {
+				m.logger.Debug("Failed to send peer disconnected notification", "error", err)
+			}
+		}
 	}
 }
