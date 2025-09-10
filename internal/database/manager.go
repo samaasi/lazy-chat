@@ -125,8 +125,8 @@ CREATE TABLE IF NOT EXISTS groups (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     description TEXT,
-    admin_id TEXT NOT NULL,
-    is_public BOOLEAN DEFAULT FALSE,
+    created_by TEXT NOT NULL,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
@@ -167,8 +167,8 @@ CREATE INDEX IF NOT EXISTS idx_messages_read ON messages(read);
 CREATE INDEX IF NOT EXISTS idx_messages_delivered ON messages(delivered);
 
 -- Group indexes
-CREATE INDEX IF NOT EXISTS idx_groups_admin_id ON groups(admin_id);
-CREATE INDEX IF NOT EXISTS idx_groups_is_public ON groups(is_public);
+CREATE INDEX IF NOT EXISTS idx_groups_created_by ON groups(created_by);
+CREATE INDEX IF NOT EXISTS idx_groups_is_active ON groups(is_active);
 
 -- Group member indexes
 CREATE INDEX IF NOT EXISTS idx_group_members_peer_id ON group_members(peer_id);
