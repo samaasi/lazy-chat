@@ -49,8 +49,15 @@ type Deps struct {
 	History   *services.MessageHistoryService
 	Files     *filetransfer.Manager
 	Verify    storage.VerificationStorage
+	Relay     RelayInfo
 	StartedAt time.Time
 	Version   string
+}
+
+// RelayInfo reports what this peer holds for others.
+type RelayInfo interface {
+	Enabled() bool
+	Usage(ctx context.Context) (envelopes int, bytes, capacity int64, err error)
 }
 
 // CLI handles command line interface interactions
@@ -223,6 +230,7 @@ func (c *CLI) buildCommands() []command {
 		{[]string{"/recent", "/r"}, "[count]", "Show the newest messages", c.cmdRecent},
 		{[]string{"/search"}, "<text>", "Search message history", c.cmdSearch},
 		{[]string{"/export"}, "<peer|group> <file> [text|json]", "Export a conversation to a new file", c.cmdExport},
+		{[]string{"/relay"}, "", "Show messages held for offline peers", c.cmdRelay},
 		{[]string{"/status", "/st"}, "", "Show application status", c.cmdStatus},
 		{[]string{"/quit", "/exit", "/q"}, "", "Exit", func(context.Context, string) error {
 			c.Console.Printf("Goodbye!")
@@ -506,6 +514,25 @@ func (c *CLI) cmdConnections(ctx context.Context, _ string) error {
 	return nil
 }
 
+func (c *CLI) cmdRelay(ctx context.Context, _ string) error {
+	if c.Relay == nil {
+		c.Console.Printf("Offline delivery is not available.")
+		return nil
+	}
+	n, used, capacity, err := c.Relay.Usage(ctx)
+	if err != nil {
+		return err
+	}
+	if c.Relay.Enabled() {
+		c.Console.Printf("Relaying is ON: holding %d encrypted message(s) for others (%s of %s).", n, ui.FormatBytes(used), ui.FormatBytes(capacity))
+		c.Console.Printf("You can see who they are from and for, but never what they say.")
+	} else {
+		c.Console.Printf("Relaying is OFF: you do not hold messages for others (start with --relay to turn it on).")
+		c.Console.Printf("You can still send to offline peers through other peers' relays.")
+	}
+	return nil
+}
+
 func (c *CLI) cmdStatus(context.Context, string) error {
 	c.Console.Printf("Name:                %s", c.SelfName)
 	c.Console.Printf("Peer ID:             %s", c.SelfID)
@@ -527,10 +554,15 @@ func (c *CLI) cmdSend(ctx context.Context, arg string) error {
 	if err != nil {
 		return err
 	}
-	if err := c.Handler.SendMessage(ctx, id, parts[1]); err != nil {
+	err = c.Handler.SendMessage(ctx, id, parts[1])
+	note := ""
+	switch {
+	case messaging.IsQueued(err):
+		note = "  (offline: queued with relays, delivered when they return)"
+	case err != nil:
 		return err
 	}
-	c.Console.Printf("[%s] you -> %s: %s", time.Now().Format("15:04:05"), c.name(id), clean(parts[1], 0))
+	c.Console.Printf("[%s] you -> %s: %s%s", time.Now().Format("15:04:05"), c.name(id), clean(parts[1], 0), note)
 	return nil
 }
 
@@ -548,6 +580,9 @@ func (c *CLI) cmdGroupMsg(ctx context.Context, arg string) error {
 		return err
 	}
 	c.Console.Printf("[%s] you -> [%s]: %s", time.Now().Format("15:04:05"), clean(g.Name, models.MaxGroupNameLen), clean(parts[1], 0))
+	for _, peerID := range res.Relayed {
+		c.Console.Printf("  %s is offline: queued with relays, delivered when they return", c.name(peerID))
+	}
 	for peerID, ferr := range res.Failed {
 		c.Console.Printf("  not delivered to %s: %v", c.name(peerID), ferr)
 	}

@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/samaasi/lazy-chat/internal/models"
+	"github.com/samaasi/lazy-chat/internal/utils"
 )
 
 // Relayer hands an end-to-end encrypted copy of a message to peers that will
@@ -39,12 +41,22 @@ const (
 	relayBatch = 50
 )
 
+// relayedPayload is what travels inside the end-to-end encryption of a relayed
+// message: the chat message itself plus the sender's display name. The
+// recipient may never have seen the sender online, so without the name it could
+// only show "unknown". The name has the same standing as the one in a live
+// Hello: self-declared, but only ever displayed, never trusted for anything.
+type relayedPayload struct {
+	*models.ChatMessage
+	SenderName string `json:"sender_name,omitempty"`
+}
+
 // relayCopy encrypts msg for its recipient and hands it to relays.
 func (h *Handler) relayCopy(ctx context.Context, to string, msg *models.ChatMessage) (int, error) {
 	if h.Relay == nil {
 		return 0, errors.New("offline delivery is not available")
 	}
-	plain, err := json.Marshal(msg)
+	plain, err := json.Marshal(relayedPayload{ChatMessage: msg, SenderName: h.SelfName})
 	if err != nil {
 		return 0, err
 	}
@@ -84,11 +96,15 @@ func (h *Handler) relayPending(ctx context.Context, peerID string) int {
 // checks as one received live. It returns the message ID, for the receipt,
 // and whether the message was accepted (a duplicate counts as accepted).
 func (h *Handler) AcceptRelayed(ctx context.Context, senderID string, plaintext []byte) (string, bool) {
-	var msg models.ChatMessage
-	if err := json.Unmarshal(plaintext, &msg); err != nil {
+	in := relayedPayload{ChatMessage: &models.ChatMessage{}}
+	if err := json.Unmarshal(plaintext, &in); err != nil {
 		return "", false
 	}
+	msg := *in.ChatMessage
 	sentAt := msg.Timestamp
+	if name := strings.TrimSpace(utils.SanitizeText(in.SenderName, 32)); name != "" {
+		h.names.Store(senderID, name)
+	}
 
 	group, err := h.checkInbound(ctx, senderID, &msg)
 	if err != nil {

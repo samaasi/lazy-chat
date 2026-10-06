@@ -259,6 +259,39 @@ func TestRelayedTimestampsAreClamped(t *testing.T) {
 	}
 }
 
+func TestSendersNameTravelsWithARelayedMessage(t *testing.T) {
+	e := newEnv(t, 1, "me")
+	alice := pid(2) // never seen online: no live name known
+	plain := []byte(`{"id":"m1","to":"` + e.self + `","message":"hi","type":"direct","sender_name":"Alice\u001b[2J\n"}`)
+	if _, ok := e.h.AcceptRelayed(bg, alice, plain); !ok {
+		t.Fatal("rejected")
+	}
+	out := e.out.all()
+	if !strings.Contains(out, "Alice") || strings.Contains(out, "unknown") || strings.ContainsAny(out, "") {
+		t.Fatalf("the sender should be shown by their (sanitised) name: %q", out)
+	}
+}
+
+func TestOutgoingRelayedPayloadCarriesOurName(t *testing.T) {
+	e := newEnv(t, 1, "Me Myself")
+	var payload []byte
+	e.h.Relay = relayFunc(func(_ context.Context, _ string, p []byte) (int, error) { payload = p; return 1, nil })
+	bob := pid(2)
+	e.net.failFor[bob] = errors.New("offline")
+	if !IsQueued(e.h.SendMessage(bg, bob, "hi")) {
+		t.Fatal("not queued")
+	}
+	if !strings.Contains(string(payload), `"sender_name":"Me Myself"`) {
+		t.Fatalf("payload: %s", payload)
+	}
+}
+
+type relayFunc func(context.Context, string, []byte) (int, error)
+
+func (f relayFunc) Dispatch(ctx context.Context, to string, p []byte) (int, error) {
+	return f(ctx, to, p)
+}
+
 // Relayed messages get no shortcut around validation.
 func TestRelayedMessagesAreValidatedLikeLiveOnes(t *testing.T) {
 	e := newEnv(t, 1, "me")

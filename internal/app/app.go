@@ -24,7 +24,9 @@ import (
 	"github.com/samaasi/lazy-chat/internal/messaging"
 	"github.com/samaasi/lazy-chat/internal/network"
 	"github.com/samaasi/lazy-chat/internal/notification"
+	"github.com/samaasi/lazy-chat/internal/offline"
 	"github.com/samaasi/lazy-chat/internal/peer"
+	"github.com/samaasi/lazy-chat/internal/relay"
 	"github.com/samaasi/lazy-chat/internal/services"
 	"github.com/samaasi/lazy-chat/internal/storage"
 	"github.com/samaasi/lazy-chat/internal/ui"
@@ -72,6 +74,7 @@ type App struct {
 	handler   *messaging.Handler
 	files     *filetransfer.Manager
 	notifier  *notification.NotificationManager
+	relay     *relay.Manager
 	db        *storage.SQLiteDB
 	groups    *services.GroupService
 	history   *services.MessageHistoryService
@@ -177,10 +180,16 @@ func New(cfg *config.Config, opts ...Option) (_ *App, err error) {
 	groups := services.NewGroupService(db, db, id.ID(), cfg.Username)
 	history := services.NewMessageHistoryService(db, db, id.ID())
 
+	relayMgr := relay.NewManager(relay.Options{Enabled: cfg.Relay, MaxStorage: cfg.RelayMaxStorage}, relay.Deps{
+		Logger: log, Self: id, Net: netMgr, Offline: offline.NewService(id, db), Store: db,
+	})
 	handler := messaging.NewHandler(messaging.Deps{
 		Logger: log, SelfID: id.ID(), SelfName: cfg.Username, Net: netMgr, Store: db,
-		Groups: groups, Peers: peers, Notifier: notifier, Out: console,
+		Groups: groups, Peers: peers, Notifier: notifier, Out: console, Relay: relayMgr,
 	})
+	relayMgr.SetHandlers(handler.AcceptRelayed, handler.ApplyReceipt)
+	relayMgr.Register()
+	undo = append(undo, relayMgr.Close)
 	files := filetransfer.NewManager(filetransfer.Options{
 		DownloadDir: cfg.DownloadDir,
 		MaxFileSize: cfg.MaxFileSize,
@@ -194,14 +203,14 @@ func New(cfg *config.Config, opts ...Option) (_ *App, err error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	a := &App{
-		config: cfg, logger: log, id: id, peers: peers, netMgr: netMgr, handler: handler, files: files,
+		config: cfg, logger: log, id: id, peers: peers, netMgr: netMgr, handler: handler, files: files, relay: relayMgr,
 		notifier: notifier, db: db, groups: groups, history: history, console: console,
 		discovery: discovery.NewService(discovery.OptionsFromConfig(cfg), id, log, peers),
 		ctx:       ctx, cancel: cancel,
 	}
 	a.cli = cli.New(cli.Deps{
 		In: o.in, Console: console, SelfID: id.ID(), SelfName: cfg.Username,
-		Peers: peers, Net: netMgr, Handler: handler, Groups: groups, History: history, Files: files, Verify: db,
+		Peers: peers, Net: netMgr, Handler: handler, Groups: groups, History: history, Files: files, Verify: db, Relay: relayMgr,
 		StartedAt: time.Now(), Version: o.version,
 	})
 	return a, nil
@@ -277,6 +286,7 @@ func (a *App) Stop() error {
 		}
 		// Stop producing work before closing the connections it uses.
 		a.handler.Close()
+		a.relay.Close()
 		a.files.Close()
 		if started {
 			_ = a.netMgr.Stop()
@@ -350,6 +360,11 @@ func (a *App) cleanupRoutine() {
 		case <-ticker.C:
 			a.peers.CleanupStalePeers(peerTTL)
 			a.handler.RetryAll(a.ctx)
+			mctx, mcancel := context.WithTimeout(a.ctx, 10*time.Second)
+			if err := a.relay.Maintain(mctx); err != nil && a.ctx.Err() == nil {
+				a.logger.Debug("Relay maintenance failed", "error", err)
+			}
+			mcancel()
 			ctx, cancel := context.WithTimeout(a.ctx, 5*time.Second)
 			if _, err := a.groups.CleanupExpiredInvites(ctx); err != nil && a.ctx.Err() == nil {
 				a.logger.Debug("Invite cleanup failed", "error", err)
