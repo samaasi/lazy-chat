@@ -1,6 +1,6 @@
 # Lazy Chat
 
-A peer-to-peer chat for your local network, written in Go. There is no server and there are no accounts: peers find each other automatically, talk over encrypted and mutually authenticated connections, and keep their history in a local database that is itself encrypted.
+A peer-to-peer chat for your local network, written in Go. There is no server and there are no accounts: peers find each other automatically, talk over encrypted and mutually authenticated connections, and keep their history in a local database that is itself encrypted. Messages even reach people who are offline: other peers hold an end-to-end encrypted copy until the recipient comes back.
 
 - [Features](#features)
 - [Quick start](#quick-start)
@@ -16,7 +16,8 @@ A peer-to-peer chat for your local network, written in Go. There is no server an
 
 ## Features
 
-- **Direct messages and groups**, with delivery receipts, automatic retry of anything that could not be delivered, and searchable, exportable history
+- **Direct messages and groups**, with delivery receipts, searchable and exportable history, and automatic retry of anything that could not be delivered
+- **Offline delivery**: write to someone who is not online and the message is end-to-end encrypted to them and held by other peers until they return, even if you are offline by then too. You get a signed receipt when it arrives.
 - **Automatic discovery** of peers on the LAN (signed UDP broadcasts)
 - **Layered encryption**: TLS 1.3 between peers, a Double Ratchet on top for per-message forward secrecy, and encryption at rest for your database and private key
 - **Verifiable identities**: every peer is its own key; compare *safety numbers* to be sure you are talking to the right person
@@ -78,6 +79,7 @@ Trying it on one machine? Give each instance its own port and data directory:
 | `/history <peer> [n]`, `/grouphistory <group> [n]`, `/recent [n]` | Read history |
 | `/search <text>` | Search all messages |
 | `/export <peer\|group> <file> [text\|json]` | Export a conversation to a *new* file |
+| `/relay` | Show how many messages you are holding for offline peers |
 | `/status`, `/quit` | Status and exit |
 
 ## Configuration
@@ -98,6 +100,8 @@ The config file is `./config.json` if present, or the path given with `-c/--conf
 | `--db-path` / `database.path` | `<data-dir>/lazy-chat.db` | SQLite database |
 | `--encryption` / `encryption` | `auto` | `auto`, `passphrase`, `os` or `off` |
 | `--passphrase-file` / `passphrase_file` | none | File whose first line is the passphrase |
+| `--relay` / `relay` | on | Hold encrypted messages for offline peers (`--relay=false` to opt out) |
+| `--relay-max-storage` / `relay_max_storage` | `67108864` | Most bytes of other peers' messages to hold |
 | `--download-dir` / `download_dir` | `downloads` | Where received files go |
 | `--max-file-size` / `max_file_size` | `268435456` | Largest incoming file, bytes |
 | `--auto-accept-files` / `auto_accept_files` | off | Accept incoming files without asking |
@@ -119,14 +123,15 @@ The passphrase is asked for at start-up. For services and scripts, put it in a f
 
 ## Security
 
-Lazy Chat protects a conversation in four independent layers.
+Lazy Chat protects a conversation in independent layers.
 
 | Layer | What it gives you |
 | --- | --- |
 | **Identity** | Your peer ID *is* the fingerprint of your Ed25519 key. An ID cannot be claimed without the private key. |
 | **Transport: TLS 1.3, mutually authenticated** | Confidentiality and integrity on the wire. When you connect to a discovered peer, its key must match the ID it announced, so forged or hijacked discovery data cannot send you to an impostor. |
 | **Message layer: Double Ratchet** | Every message has its own key, deleted after use, and keys are renewed by fresh Diffie-Hellman exchanges each time the conversation changes direction. Capturing a session's state reveals nothing sent earlier (**forward secrecy**), and the session closes itself to an attacker after one round trip (**post-compromise security**). Replayed, reordered, tampered or unencrypted frames end the connection. |
-| **At rest: AES-256-GCM** | Message text, group and member names, invitations and your private key are stored encrypted. |
+| **At rest: AES-256-GCM** | Message text, group and member names, invitations, your private key and your prekeys are stored encrypted. |
+| **Offline messages: prekeys (X3DH-style)** | A message to someone who is not online is encrypted to *their* keys before it leaves your machine. Whoever stores it on the way can neither read nor alter it. |
 
 Beyond that:
 
@@ -135,14 +140,32 @@ Beyond that:
 - **Untrusted text.** Names and messages are stripped of terminal escape sequences and bidirectional overrides before display, logging or notifications. Notification text is never placed in a script.
 - **Files.** Nothing is written until you accept; names are reduced to a single safe name inside the download directory; existing files are never overwritten; data is checked against a SHA-256 before it appears under its final name.
 - **Limits.** Message and frame sizes, connections (total and per IP), handshake time, message rate, peers per address, pending offers and file size are all bounded.
-- **Delivery.** Messages that could not be delivered are retried automatically when the peer reconnects and periodically while it is visible (direct messages, up to 7 days). Receivers deduplicate, so a retry is always safe.
+- **Delivery.** A message that cannot be delivered right away is retried automatically when the peer reconnects and periodically while it is visible (direct messages, up to 7 days), and is also queued with relays so it arrives even if you are offline when the recipient returns. Receivers deduplicate, so a retry or a second copy is always safe.
+
+### Offline delivery and relays
+
+When you write to someone who is offline, your app encrypts the message to the recipient's *prekeys*, hands the ciphertext to a few of the peers you are connected to (**relays**), and keeps the message marked "not delivered". When the recipient next connects to any of those relays they receive it, store it like any other message, and send back a **receipt signed with their identity key**. The relay passes the receipt on to you, even if you were offline when the message was delivered, and only then does the message show as delivered.
+
+Peers exchange prekey bundles whenever they connect, so you can write to anyone you have met once, or whose bundle a mutual peer already holds (it asks on your behalf). The bundle is signed by the owner's identity key, so whoever relays it cannot swap in their own.
+
+| A relay | |
+| --- | --- |
+| **can see** | who a message is from and for, when it was stored, and roughly how big it is |
+| **cannot** | read it, alter it, forge a receipt, or pretend to be the sender |
+| **can** | delay or drop it, which is why senders use several relays and keep retrying direct delivery |
+
+Relays are bounded: total storage (`--relay-max-storage`), messages and bytes per sender, messages per recipient, a 7-day expiry, and only the addressee can acknowledge or remove a held message. Turn relaying off with `--relay=false`; you can still send through other peers' relays.
+
+Forward secrecy for offline messages comes from deleting keys. Each message uses a fresh ephemeral key plus, when available, a one-time prekey that is reserved for you alone and destroyed the first time it opens a message. If none are left, protection falls back to the weekly-rotated signed prekey, which is deleted after four weeks, so those messages are protected only until then.
 
 **What is not protected**
 
-- *Metadata.* Peer IDs, timestamps, group IDs and delivery flags stay readable in the database (they are needed to query it), and discovery announcements (username, TCP port) are broadcast in clear text to the whole LAN. Anyone on the network can see *that* you are online, though not what you say.
+- *Metadata.* Peer IDs, timestamps, group IDs and delivery flags stay readable in the database (they are needed to query it), and discovery announcements (username, TCP port) are broadcast in clear text to the whole LAN. Anyone on the network can see *that* you are online, though not what you say. A relay additionally learns who is writing to whom, and when, for the messages it holds.
 - *Received files and exports* are ordinary files and are not encrypted; keep them on an encrypted disk if that matters.
 - *Memory.* Keys and plaintext exist in process memory while the program runs. DPAPI protects against another user or a stolen disk, not against malware running as you.
-- *Ratchet scope.* Ratchet sessions live as long as a connection; they are not stored. Retried messages are re-encrypted for the new connection. Group messages are delivered to each member over their pairwise links, and are not retried automatically.
+- *Ratchet scope.* Ratchet sessions live as long as a connection; they are not stored. Retried messages are re-encrypted for the new connection. Offline messages use their own per-message encryption (above) rather than a ratchet, so they have no post-compromise healing.
+- *Group messages and offline members.* A group message to a member who is offline is queued with relays at the moment you send it, but unlike direct messages it is not re-queued later if that failed.
+- *Relays can delay or drop.* A message queued with relays is a best effort; delivery is proven only by the recipient's receipt.
 - *Groups are simple.* The creator is the only admin, and every member keeps their own copy of the group. Someone whose invitation you accept can describe the membership list inaccurately.
 - *Trust on first use.* Until you compare safety numbers, you trust that the ID you see belongs to the person you think it does.
 - Chat is for trusted local networks. Do not expose the TCP port to the internet.
@@ -154,6 +177,8 @@ Beyond that:
 | Identity key | `<data-dir>/identity.key` (encrypted once encryption is on) |
 | Wrapped data key | `<data-dir>/vault.key` |
 | Messages, groups, invitations, verification marks | SQLite database; schema versioned with `PRAGMA user_version` |
+| Your prekeys and other peers' prekey bundles | The same database (private keys encrypted) |
+| Messages held for others | The same database (end-to-end encrypted blobs; expire after 7 days) |
 | Received files | `download_dir` (partial files are `.lazychat-*.part` and are removed on failure) |
 | Logs | stderr, or `log_file` |
 
@@ -174,6 +199,8 @@ internal/
   identity/          Ed25519 identity, TLS certificate, safety numbers
   messaging/         direct messages, groups, retry
   network/           TLS transport, connection management
+  offline/           prekeys and encryption to offline recipients
+  relay/             store-and-forward: sender, relay and recipient roles
   protocol/          wire frames and payloads
   ratchet/           Double Ratchet
   services/          group and history rules
@@ -183,6 +210,8 @@ internal/
 ```
 
 A connection goes through these steps: TCP, TLS 1.3 handshake with mutual authentication (each side learns the other's authentic ID), `Hello` exchange, then a ratchet handshake whose ephemeral keys are signed with each identity key and bound to the TLS session. After that every application frame travels inside a ratchet-sealed `Secure` frame.
+
+Offline delivery sits beside this: prekey bundles ride the same secure connections, `relay` hands sealed messages to peers that agree to hold them, and the recipient's receipt returns the same way.
 
 Wire format: frames are `kind (1 byte) | length (4 bytes) | body`. Control frames are JSON, file chunks are raw bytes. The maximum body size is fixed per kind and checked before any allocation.
 
@@ -211,7 +240,8 @@ GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o lazy-chat-linux-arm64 ./cmd
 - **`a passphrase is required`**: no terminal is attached. Use `--passphrase-file` (or `--encryption off` to opt out).
 - **`encryption is switched off`**: the data is already encrypted; remove `--encryption off`.
 - **`could not connect`**: the peer's firewall, or the peer restarted with a new identity. Wait for its next announcement and retry.
-- **Messages show "(not delivered)"**: the peer was unreachable. They are retried automatically when it reconnects.
+- **Messages show "(not delivered)"**: the peer was unreachable. If you were connected to anyone who could hold it, it is queued with relays ("queued with relays") and will arrive when they return; otherwise it is retried automatically when you next reach them or a relay. It changes to delivered only when the recipient's signed receipt arrives.
+- **"saved but not delivered" when writing to an offline peer**: you have never met them (no prekey bundle) and nobody connected to you holds one, or none of your connected peers is willing to hold messages. Connect to a peer who knows them, or wait until they are online.
 - **No notifications**: enable with `--notifications`; Linux needs `notify-send` (libnotify).
 
 ## Roadmap
@@ -224,8 +254,9 @@ GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o lazy-chat-linux-arm64 ./cmd
 - [x] Out-of-band verification (safety numbers)
 - [x] Verified file transfer
 - [x] Automatic retry of undelivered direct messages
-- [ ] Per-recipient retry of group messages
-- [ ] Relay / store-and-forward for peers that are never online together
+- [x] Offline delivery: end-to-end encrypted store-and-forward through relays, with signed receipts
+- [ ] Re-queueing of group messages to offline members after the first attempt
+- [ ] Hiding the sender from relays (sealed sender)
 - [ ] macOS Keychain and Linux Secret Service key storage (today: passphrase)
 - [ ] Web interface
 
