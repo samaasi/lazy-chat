@@ -77,7 +77,6 @@ func TestStatusLineIsReplacedByNextOutput(t *testing.T) {
 	}
 }
 
-
 type fakeDisplay struct {
 	mu    sync.Mutex
 	lines []string

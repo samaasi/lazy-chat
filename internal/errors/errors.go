@@ -24,7 +24,7 @@ type AppError struct {
 	Code    string
 	Message string
 	Cause   error
-	Context map[string]interface{}
+	Context map[string]any
 }
 
 // Error implements the error interface
@@ -50,9 +50,9 @@ func (e *AppError) Is(target error) bool {
 // WithContext returns a copy of the error with the extra context attached.
 // The receiver is never modified: the package-level Err* values are shared
 // by every goroutine, so mutating them would be a data race.
-func (e *AppError) WithContext(key string, value interface{}) *AppError {
+func (e *AppError) WithContext(key string, value any) *AppError {
 	clone := *e
-	clone.Context = make(map[string]interface{}, len(e.Context)+1)
+	clone.Context = make(map[string]any, len(e.Context)+1)
 	for k, v := range e.Context {
 		clone.Context[k] = v
 	}
@@ -66,7 +66,7 @@ func New(errorType ErrorType, code, message string) *AppError {
 		Type:    errorType,
 		Code:    code,
 		Message: message,
-		Context: make(map[string]interface{}),
+		Context: make(map[string]any),
 	}
 }
 
@@ -77,7 +77,7 @@ func Wrap(err error, errorType ErrorType, code, message string) *AppError {
 		Code:    code,
 		Message: message,
 		Cause:   err,
-		Context: make(map[string]interface{}),
+		Context: make(map[string]any),
 	}
 }
 

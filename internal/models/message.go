@@ -56,18 +56,6 @@ func NewGroupMessage(id, from, groupID, message string) *ChatMessage {
 	}
 }
 
-// NewSystemMessage creates a new system message
-func NewSystemMessage(id, message string) *ChatMessage {
-	return &ChatMessage{
-		ID:        id,
-		From:      "system",
-		Message:   message,
-		Type:      MessageTypeSystem,
-		Timestamp: time.Now(),
-		Delivered: true,
-	}
-}
-
 // IsDirectMessage checks if the message is a direct message
 func (m *ChatMessage) IsDirectMessage() bool { return m.Type == MessageTypeDirect }
 

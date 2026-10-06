@@ -12,13 +12,12 @@ func TestIDsAreUniqueUnderConcurrency(t *testing.T) {
 		seen = make(map[string]struct{}, n)
 		wg   sync.WaitGroup
 	)
-	g := NewIDGenerator()
 	for range 8 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for range n / 8 {
-				id := g.GenerateID()
+				id := NewID()
 				if len(id) != 32 {
 					t.Errorf("unexpected id length %d", len(id))
 				}

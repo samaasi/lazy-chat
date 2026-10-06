@@ -166,7 +166,7 @@ func (c *Config) loadFromEnv(getenv func(string) string) error {
 	}
 	bindings := []struct {
 		name string
-		ptr  interface{}
+		ptr  any
 	}{
 		{"P2P_USERNAME", &c.Username},
 		{"P2P_TCP_PORT", &c.TCPPort},
@@ -292,7 +292,7 @@ Running two instances on one machine? Give each its own --data-dir and --port.
 
 // Validate checks if the configuration is valid
 func (c *Config) Validate() error {
-	invalid := func(field string, value interface{}, reason string) error {
+	invalid := func(field string, value any, reason string) error {
 		e := apperrors.ErrConfigValidation.WithContext("field", field).WithContext("value", value)
 		if reason != "" {
 			e = e.WithContext("reason", reason)

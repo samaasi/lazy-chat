@@ -114,20 +114,20 @@ func Discard() *Logger {
 }
 
 // Debug logs a debug message with optional key-value pairs
-func (l *Logger) Debug(msg string, kv ...interface{}) { l.l.Debug(msg, kv...) }
+func (l *Logger) Debug(msg string, kv ...any) { l.l.Debug(msg, kv...) }
 
 // Info logs an info message with optional key-value pairs
-func (l *Logger) Info(msg string, kv ...interface{}) { l.l.Info(msg, kv...) }
+func (l *Logger) Info(msg string, kv ...any) { l.l.Info(msg, kv...) }
 
 // Warn logs a warning message with optional key-value pairs
-func (l *Logger) Warn(msg string, kv ...interface{}) { l.l.Warn(msg, kv...) }
+func (l *Logger) Warn(msg string, kv ...any) { l.l.Warn(msg, kv...) }
 
 // Error logs an error message with optional key-value pairs
-func (l *Logger) Error(msg string, kv ...interface{}) { l.l.Error(msg, kv...) }
+func (l *Logger) Error(msg string, kv ...any) { l.l.Error(msg, kv...) }
 
 // Fatal logs at error level, flushes and exits the process. Prefer returning
 // errors; this exists to satisfy interfaces.Logger.
-func (l *Logger) Fatal(msg string, kv ...interface{}) {
+func (l *Logger) Fatal(msg string, kv ...any) {
 	l.l.Error(msg, kv...)
 	_ = l.Close()
 	os.Exit(1)
