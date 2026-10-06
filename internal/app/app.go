@@ -73,7 +73,7 @@ func New(cfg *config.Config) (*App, error) {
 	peerMgr := peer.NewManager(log)
 
 	// Create notification manager
-	notificationMgr := notification.NewNotificationManager(cfg.NotificationsEnabled)
+	notificationMgr := notification.NewNotificationManager(cfg.NotificationsEnabled, log)
 
 	// Open the database; the storage layer owns the one and only schema.
 	sqliteDB := storage.NewSQLiteDB(cfg.Database.Path)
