@@ -11,6 +11,8 @@
   "log_format": "text",
   "log_file": "",
   "notifications_enabled": false,
+  "encryption": "auto",
+  "passphrase_file": "",
   "download_dir": "downloads",
   "max_file_size": 268435456,
   "auto_accept_files": false
