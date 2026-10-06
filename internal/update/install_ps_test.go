@@ -10,12 +10,25 @@ import (
 	"testing"
 )
 
+// withoutPSModulePath drops PSModulePath. CI runs tests from PowerShell 7, whose
+// module path would otherwise be inherited by Windows PowerShell 5.1 (what the
+// installer runs under for real users), which then cannot find its own modules.
+func withoutPSModulePath(env []string) []string {
+	var out []string
+	for _, e := range env {
+		if !strings.HasPrefix(strings.ToUpper(e), "PSMODULEPATH=") {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
 func runPowerShell(t *testing.T, srv *httptest.Server, dir string, extra ...string) (string, error) {
 	t.Helper()
 	script, _ := filepath.Abs("../../scripts/install.ps1")
 	cmd := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
 		"Invoke-Expression ([IO.File]::ReadAllText($env:LAZYCHAT_SCRIPT))")
-	cmd.Env = append(os.Environ(),
+	cmd.Env = append(withoutPSModulePath(os.Environ()),
 		"LAZYCHAT_SCRIPT="+script,
 		"LAZYCHAT_BASE_URL="+srv.URL,
 		"LAZYCHAT_KEY_URL="+srv.URL+"/key.pub",
@@ -89,7 +102,9 @@ func TestInstallPowerShellScript(t *testing.T) {
 		t.Run("refuses: "+name, func(t *testing.T) {
 			f := newFakeRelease(t, "v1.4.0", []byte("unused"))
 			srv := serveInstallRelease(t, f, "windows", arch)
+			f.mu.Lock() // the server's handlers read these files concurrently
 			tamper(f)
+			f.mu.Unlock()
 			dir := filepath.Join(t.TempDir(), "bin")
 			out, err := runPowerShell(t, srv, dir)
 			if err == nil {

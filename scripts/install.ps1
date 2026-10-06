@@ -137,13 +137,16 @@
             if ($f.Count -eq 2 -and ($f[1] -eq $archive -or $f[1] -eq "*$archive")) { $want = $f[0]; break }
         }
         if (-not $want) { Fail "no checksum listed for $archive" }
-        $got = (Get-FileHash -Algorithm SHA256 -Path (Join-Path $tmp $archive)).Hash
+        # .NET directly: Get-FileHash is missing from PowerShell 3 and fails to load when PSModulePath is unusual.
+        $sha = [Security.Cryptography.SHA256]::Create()
+        $got = ([BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadAllBytes((Join-Path $tmp $archive)))) -replace '-', '')
         if ($want -ne $got) { Fail "checksum mismatch for $archive (expected $want, got $got): refusing to install" }
         Write-Host 'Checksum verified.'
 
         # ---- Install -------------------------------------------------------------
         $x = Join-Path $tmp 'x'
-        Expand-Archive -Path (Join-Path $tmp $archive) -DestinationPath $x
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        [IO.Compression.ZipFile]::ExtractToDirectory((Join-Path $tmp $archive), $x)
         $exe = Get-ChildItem -Path $x -Recurse -Filter 'lazy-chat.exe' | Select-Object -First 1
         if (-not $exe -or $exe.Length -eq 0) { Fail 'lazy-chat.exe is not in the archive' }
 

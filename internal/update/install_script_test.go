@@ -157,7 +157,9 @@ func TestInstallScript(t *testing.T) {
 			}
 			f := newFakeRelease(t, "v1.4.0", []byte("unused"))
 			srv := serveInstallRelease(t, f, goos, goarch)
+			f.mu.Lock() // the server's handlers read these files concurrently
 			tamper(f)
+			f.mu.Unlock()
 			dir := filepath.Join(t.TempDir(), "bin")
 			out, err := runInstall(t, srv, dir)
 			if err == nil {

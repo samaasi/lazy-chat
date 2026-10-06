@@ -335,7 +335,9 @@ func TestInstallRefusesAnythingThatIsNotAuthentic(t *testing.T) {
 	for name, attack := range attacks {
 		t.Run(name, func(t *testing.T) {
 			f := newFakeRelease(t, "v1.4.0", []byte("EVIL"))
+			f.mu.Lock() // the server's handlers read these files concurrently
 			attack(f)
+			f.mu.Unlock()
 			exe := installedExe(t, "OLD BINARY")
 			u := f.updater("v1.3.0")
 			rel, err := u.Latest(bg)
