@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/samaasi/lazy-chat/internal/models"
@@ -292,28 +293,40 @@ func (s *SQLiteDB) PruneBundles(ctx context.Context, max int) (int64, error) {
 // ---- Relay -------------------------------------------------------------------
 
 // RelayEnvelope is an opaque end-to-end encrypted message we are holding for
-// someone else. The relay sees who it is from and for, never what it says.
+// someone else. We know who it is for, never what it says and - with sealed
+// sender - not who wrote it: Submitter is whoever handed it to us, which is the
+// sender or, when she used a forwarder, the forwarder.
 type RelayEnvelope struct {
-	ID, From, To     string
-	Blob             []byte
-	Created, Expires time.Time
+	ID, Submitter, To string
+	Blob              []byte
+	Created, Expires  time.Time
 }
 
-// RelayReceipt is a recipient-signed proof of delivery, held until the
-// original sender next connects.
+// RelayReceipt is a recipient-signed proof of delivery, held under a random
+// mailbox tag that only the sender and the recipient know, until the sender
+// asks for it. The relay cannot tell whose mailbox it is.
 type RelayReceipt struct {
-	To, MsgID, Signer string
-	EdPub, Sig        []byte
-	Expires           time.Time
+	Tag, MsgID, Signer string
+	EdPub, Sig         []byte
+	Expires            time.Time
+}
+
+// OutboxEntry records that we queued a message for To with a relay, and the
+// mailbox tag its receipt will appear under.
+type OutboxEntry struct {
+	MsgID, RelayID, To, Tag string
+	Created                 time.Time
 }
 
 // RelayLimits bounds what a relay stores so nobody can fill its disk.
 type RelayLimits struct {
-	MaxTotalBytes     int64
+	MaxTotalBytes int64
+	// MaxPerSender and MaxBytesPerSender apply per submitter.
 	MaxPerSender      int
 	MaxBytesPerSender int64
 	MaxPerRecipient   int
-	MaxReceipts       int
+	// MaxReceipts bounds the receipts held per signer.
+	MaxReceipts int
 }
 
 // QuotaError reports why a relay refused to store something.
@@ -328,10 +341,17 @@ type RelayStorage interface {
 	// TakeEnvelope removes and returns an envelope, but only for its recipient.
 	TakeEnvelope(ctx context.Context, id, to string) (*RelayEnvelope, error)
 	PutReceipt(ctx context.Context, r RelayReceipt, lim RelayLimits) error
-	ReceiptsFor(ctx context.Context, to string, now time.Time, limit int) ([]RelayReceipt, error)
-	DeleteReceipt(ctx context.Context, to, msgID, signer string) error
+	// ReceiptsForTags returns the unexpired receipts under any of the tags.
+	ReceiptsForTags(ctx context.Context, tags []string, now time.Time, limit int) ([]RelayReceipt, error)
 	PurgeRelay(ctx context.Context, now time.Time) (envelopes, receipts int64, err error)
 	RelayUsage(ctx context.Context) (envelopes int, bytes int64, err error)
+
+	// Our own outbox: which relays hold messages of ours.
+	AddOutbox(ctx context.Context, e OutboxEntry) error
+	Outbox(ctx context.Context, since time.Time) ([]OutboxEntry, error)
+	// DeleteOutbox forgets a message's entries once its receipt has arrived.
+	DeleteOutbox(ctx context.Context, msgID, to string) error
+	PurgeOutbox(ctx context.Context, before time.Time) (int64, error)
 }
 
 // PutEnvelope stores an envelope if quotas allow. Storing the same ID twice is
@@ -354,10 +374,10 @@ func (s *SQLiteDB) PutEnvelope(ctx context.Context, e RelayEnvelope, lim RelayLi
 	var total, senderN, senderBytes, recipientN int64
 	if err := tx.QueryRowContext(ctx, `SELECT
 		COALESCE(SUM(LENGTH(blob)), 0),
-		COALESCE(SUM(from_peer = ?), 0),
-		COALESCE(SUM(CASE WHEN from_peer = ? THEN LENGTH(blob) ELSE 0 END), 0),
+		COALESCE(SUM(submitter = ?), 0),
+		COALESCE(SUM(CASE WHEN submitter = ? THEN LENGTH(blob) ELSE 0 END), 0),
 		COALESCE(SUM(to_peer = ?), 0)
-		FROM relay_envelopes`, e.From, e.From, e.To).Scan(&total, &senderN, &senderBytes, &recipientN); err != nil {
+		FROM relay_envelopes`, e.Submitter, e.Submitter, e.To).Scan(&total, &senderN, &senderBytes, &recipientN); err != nil {
 		return fmt.Errorf("failed to read relay usage: %w", err)
 	}
 	size := int64(len(e.Blob))
@@ -372,8 +392,8 @@ func (s *SQLiteDB) PutEnvelope(ctx context.Context, e RelayEnvelope, lim RelayLi
 		return &QuotaError{"too many messages queued for that recipient"}
 	}
 
-	if _, err := tx.ExecContext(ctx, `INSERT INTO relay_envelopes (id, from_peer, to_peer, blob, created, expires)
-		VALUES (?, ?, ?, ?, ?, ?)`, e.ID, e.From, e.To, e.Blob, ms(e.Created), ms(e.Expires)); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO relay_envelopes (id, submitter, to_peer, blob, created, expires)
+		VALUES (?, ?, ?, ?, ?, ?)`, e.ID, e.Submitter, e.To, e.Blob, ms(e.Created), ms(e.Expires)); err != nil {
 		return fmt.Errorf("failed to store envelope: %w", err)
 	}
 	return tx.Commit()
@@ -381,7 +401,7 @@ func (s *SQLiteDB) PutEnvelope(ctx context.Context, e RelayEnvelope, lim RelayLi
 
 // EnvelopesFor lists unexpired envelopes for a recipient, oldest first.
 func (s *SQLiteDB) EnvelopesFor(ctx context.Context, to string, now time.Time, limit int) ([]RelayEnvelope, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, from_peer, to_peer, blob, created, expires FROM relay_envelopes
+	rows, err := s.db.QueryContext(ctx, `SELECT id, submitter, to_peer, blob, created, expires FROM relay_envelopes
 		WHERE to_peer = ? AND expires > ? ORDER BY created, id LIMIT ?`, to, ms(now), limit)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list envelopes: %w", err)
@@ -391,7 +411,7 @@ func (s *SQLiteDB) EnvelopesFor(ctx context.Context, to string, now time.Time, l
 	for rows.Next() {
 		var e RelayEnvelope
 		var created, expires int64
-		if err := rows.Scan(&e.ID, &e.From, &e.To, &e.Blob, &created, &expires); err != nil {
+		if err := rows.Scan(&e.ID, &e.Submitter, &e.To, &e.Blob, &created, &expires); err != nil {
 			return nil, err
 		}
 		e.Created, e.Expires = fromMs(created), fromMs(expires)
@@ -409,8 +429,8 @@ func (s *SQLiteDB) TakeEnvelope(ctx context.Context, id, to string) (*RelayEnvel
 	defer tx.Rollback()
 	var e RelayEnvelope
 	var created, expires int64
-	err = tx.QueryRowContext(ctx, `SELECT id, from_peer, to_peer, blob, created, expires FROM relay_envelopes
-		WHERE id = ? AND to_peer = ?`, id, to).Scan(&e.ID, &e.From, &e.To, &e.Blob, &created, &expires)
+	err = tx.QueryRowContext(ctx, `SELECT id, submitter, to_peer, blob, created, expires FROM relay_envelopes
+		WHERE id = ? AND to_peer = ?`, id, to).Scan(&e.ID, &e.Submitter, &e.To, &e.Blob, &created, &expires)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -424,7 +444,7 @@ func (s *SQLiteDB) TakeEnvelope(ctx context.Context, id, to string) (*RelayEnvel
 	return &e, tx.Commit()
 }
 
-// PutReceipt stores a receipt for later delivery to its addressee.
+// PutReceipt stores a receipt under its mailbox tag, bounded per signer.
 func (s *SQLiteDB) PutReceipt(ctx context.Context, r RelayReceipt, lim RelayLimits) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -433,24 +453,33 @@ func (s *SQLiteDB) PutReceipt(ctx context.Context, r RelayReceipt, lim RelayLimi
 	defer tx.Rollback()
 	if lim.MaxReceipts > 0 {
 		var n int
-		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM relay_receipts WHERE to_peer = ?`, r.To).Scan(&n); err != nil {
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM relay_receipts WHERE signer = ?`, r.Signer).Scan(&n); err != nil {
 			return err
 		}
 		if n >= lim.MaxReceipts {
-			return &QuotaError{"too many receipts waiting for that sender"}
+			return &QuotaError{"too many receipts stored for you"}
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO relay_receipts (to_peer, msg_id, signer, ed_pub, sig, expires)
-		VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING`, r.To, r.MsgID, r.Signer, r.EdPub, r.Sig, ms(r.Expires)); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO relay_receipts (tag, msg_id, signer, ed_pub, sig, expires)
+		VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING`, r.Tag, r.MsgID, r.Signer, r.EdPub, r.Sig, ms(r.Expires)); err != nil {
 		return fmt.Errorf("failed to store receipt: %w", err)
 	}
 	return tx.Commit()
 }
 
-// ReceiptsFor lists unexpired receipts addressed to a peer.
-func (s *SQLiteDB) ReceiptsFor(ctx context.Context, to string, now time.Time, limit int) ([]RelayReceipt, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT to_peer, msg_id, signer, ed_pub, sig, expires FROM relay_receipts
-		WHERE to_peer = ? AND expires > ? LIMIT ?`, to, ms(now), limit)
+// ReceiptsForTags returns the unexpired receipts under any of the given tags.
+func (s *SQLiteDB) ReceiptsForTags(ctx context.Context, tags []string, now time.Time, limit int) ([]RelayReceipt, error) {
+	if len(tags) == 0 {
+		return nil, nil
+	}
+	marks := strings.TrimSuffix(strings.Repeat("?,", len(tags)), ",")
+	args := make([]any, 0, len(tags)+2)
+	for _, t := range tags {
+		args = append(args, t)
+	}
+	args = append(args, ms(now), limit)
+	rows, err := s.db.QueryContext(ctx, `SELECT tag, msg_id, signer, ed_pub, sig, expires FROM relay_receipts
+		WHERE tag IN (`+marks+`) AND expires > ? LIMIT ?`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list receipts: %w", err)
 	}
@@ -459,19 +488,13 @@ func (s *SQLiteDB) ReceiptsFor(ctx context.Context, to string, now time.Time, li
 	for rows.Next() {
 		var r RelayReceipt
 		var expires int64
-		if err := rows.Scan(&r.To, &r.MsgID, &r.Signer, &r.EdPub, &r.Sig, &expires); err != nil {
+		if err := rows.Scan(&r.Tag, &r.MsgID, &r.Signer, &r.EdPub, &r.Sig, &expires); err != nil {
 			return nil, err
 		}
 		r.Expires = fromMs(expires)
 		out = append(out, r)
 	}
 	return out, rows.Err()
-}
-
-// DeleteReceipt removes a receipt once it has been handed over.
-func (s *SQLiteDB) DeleteReceipt(ctx context.Context, to, msgID, signer string) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM relay_receipts WHERE to_peer = ? AND msg_id = ? AND signer = ?`, to, msgID, signer)
-	return err
 }
 
 // PurgeRelay deletes expired envelopes and receipts.
@@ -495,6 +518,54 @@ func (s *SQLiteDB) RelayUsage(ctx context.Context) (int, int64, error) {
 	var b int64
 	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(LENGTH(blob)), 0) FROM relay_envelopes`).Scan(&n, &b)
 	return n, b, err
+}
+
+// ---- Our outbox ----------------------------------------------------------------
+
+// AddOutbox records that a message of ours is queued with a relay.
+func (s *SQLiteDB) AddOutbox(ctx context.Context, e OutboxEntry) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO relay_outbox (msg_id, relay_id, to_peer, tag, created)
+		VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING`, e.MsgID, e.RelayID, e.To, e.Tag, ms(e.Created))
+	if err != nil {
+		return fmt.Errorf("failed to record queued message: %w", err)
+	}
+	return nil
+}
+
+// Outbox lists queued messages newer than since.
+func (s *SQLiteDB) Outbox(ctx context.Context, since time.Time) ([]OutboxEntry, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT msg_id, relay_id, to_peer, tag, created FROM relay_outbox
+		WHERE created >= ? ORDER BY created`, ms(since))
+	if err != nil {
+		return nil, fmt.Errorf("failed to list queued messages: %w", err)
+	}
+	defer rows.Close()
+	var out []OutboxEntry
+	for rows.Next() {
+		var e OutboxEntry
+		var created int64
+		if err := rows.Scan(&e.MsgID, &e.RelayID, &e.To, &e.Tag, &created); err != nil {
+			return nil, err
+		}
+		e.Created = fromMs(created)
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// DeleteOutbox forgets the entries for one message to one recipient.
+func (s *SQLiteDB) DeleteOutbox(ctx context.Context, msgID, to string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM relay_outbox WHERE msg_id = ? AND to_peer = ?`, msgID, to)
+	return err
+}
+
+// PurgeOutbox forgets entries older than before.
+func (s *SQLiteDB) PurgeOutbox(ctx context.Context, before time.Time) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM relay_outbox WHERE created < ?`, ms(before))
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 // ---- Relay flag on our own messages --------------------------------------------

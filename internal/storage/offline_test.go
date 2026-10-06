@@ -190,8 +190,8 @@ func TestEnablingEncryptionAlsoCoversPrekeysAndBundles(t *testing.T) {
 
 // ---- Relay -------------------------------------------------------------------
 
-func env(id, from, to string, size int, now time.Time) RelayEnvelope {
-	return RelayEnvelope{ID: id, From: from, To: to, Blob: bytes.Repeat([]byte("x"), size), Created: now, Expires: now.Add(time.Hour)}
+func env(id, submitter, to string, size int, now time.Time) RelayEnvelope {
+	return RelayEnvelope{ID: id, Submitter: submitter, To: to, Blob: bytes.Repeat([]byte("x"), size), Created: now, Expires: now.Add(time.Hour)}
 }
 
 var generous = RelayLimits{MaxTotalBytes: 1 << 20, MaxPerSender: 100, MaxBytesPerSender: 1 << 20, MaxPerRecipient: 100, MaxReceipts: 100}
@@ -219,7 +219,7 @@ func TestRelayStoresAndHandsOverToTheRecipientOnly(t *testing.T) {
 		t.Fatalf("someone else took Bob's envelope: %v", err)
 	}
 	taken, err := db.TakeEnvelope(ctx, "e0", "bob")
-	if err != nil || taken.From != "alice" || len(taken.Blob) != 100 {
+	if err != nil || taken.Submitter != "alice" || len(taken.Blob) != 100 {
 		t.Fatalf("take: %+v %v", taken, err)
 	}
 	if _, err := db.TakeEnvelope(ctx, "e0", "bob"); !errors.Is(err, ErrNotFound) {
@@ -312,13 +312,13 @@ func TestRelayExpiry(t *testing.T) {
 	dead.Expires = now.Add(-time.Hour)
 	_ = db.PutEnvelope(ctx, live, generous)
 	_ = db.PutEnvelope(ctx, dead, generous)
-	_ = db.PutReceipt(ctx, RelayReceipt{To: "a", MsgID: "m", Signer: "bob", EdPub: key(1), Sig: key(2), Expires: now.Add(-time.Minute)}, generous)
-	_ = db.PutReceipt(ctx, RelayReceipt{To: "a", MsgID: "n", Signer: "bob", EdPub: key(1), Sig: key(2), Expires: now.Add(time.Hour)}, generous)
+	_ = db.PutReceipt(ctx, RelayReceipt{Tag: "t1", MsgID: "m", Signer: "bob", EdPub: key(1), Sig: key(2), Expires: now.Add(-time.Minute)}, generous)
+	_ = db.PutReceipt(ctx, RelayReceipt{Tag: "t2", MsgID: "n", Signer: "bob", EdPub: key(1), Sig: key(2), Expires: now.Add(time.Hour)}, generous)
 
 	if got, _ := db.EnvelopesFor(ctx, "bob", now, 10); len(got) != 1 || got[0].ID != "live" {
 		t.Fatalf("expired envelopes must not be delivered: %+v", got)
 	}
-	if got, _ := db.ReceiptsFor(ctx, "a", now, 10); len(got) != 1 || got[0].MsgID != "n" {
+	if got, _ := db.ReceiptsForTags(ctx, []string{"t1", "t2"}, now, 10); len(got) != 1 || got[0].MsgID != "n" {
 		t.Fatalf("expired receipts must not be delivered: %+v", got)
 	}
 	e, r, err := db.PurgeRelay(ctx, now)
@@ -327,36 +327,107 @@ func TestRelayExpiry(t *testing.T) {
 	}
 }
 
-func TestRelayReceipts(t *testing.T) {
+func TestRelayReceiptsAreAddressedByTagNotByIdentity(t *testing.T) {
 	db := openDB(t)
 	now := time.Now()
-	r := RelayReceipt{To: "alice", MsgID: "m1", Signer: "bob", EdPub: key(1), Sig: key(2), Expires: now.Add(time.Hour)}
+	r := RelayReceipt{Tag: "tag-1", MsgID: "m1", Signer: "bob", EdPub: key(1), Sig: key(2), Expires: now.Add(time.Hour)}
 	for range 2 { // duplicates collapse
 		if err := db.PutReceipt(ctx, r, generous); err != nil {
 			t.Fatal(err)
 		}
 	}
-	got, err := db.ReceiptsFor(ctx, "alice", now, 10)
+	got, err := db.ReceiptsForTags(ctx, []string{"tag-1"}, now, 10)
 	if err != nil || len(got) != 1 || got[0].Signer != "bob" || !bytes.Equal(got[0].Sig, key(2)) {
 		t.Fatalf("receipts: %+v %v", got, err)
 	}
-	if other, _ := db.ReceiptsFor(ctx, "carol", now, 10); len(other) != 0 {
-		t.Fatal("receipt visible to someone it was not addressed to")
+	// Asking with the wrong tag, or no tags, learns nothing.
+	if other, _ := db.ReceiptsForTags(ctx, []string{"guess", "tag-2"}, now, 10); len(other) != 0 {
+		t.Fatal("receipt visible under a tag that is not its own")
 	}
-	if err := db.DeleteReceipt(ctx, "alice", "m1", "bob"); err != nil {
-		t.Fatal(err)
+	if none, err := db.ReceiptsForTags(ctx, nil, now, 10); err != nil || len(none) != 0 {
+		t.Fatalf("no tags: %v %v", none, err)
 	}
-	if got, _ := db.ReceiptsFor(ctx, "alice", now, 10); len(got) != 0 {
-		t.Fatal("delivered receipt still stored")
+	// Several tags at once.
+	_ = db.PutReceipt(ctx, RelayReceipt{Tag: "tag-2", MsgID: "m2", Signer: "carol", EdPub: key(1), Sig: key(2), Expires: now.Add(time.Hour)}, generous)
+	if both, _ := db.ReceiptsForTags(ctx, []string{"tag-1", "tag-2", "x"}, now, 10); len(both) != 2 {
+		t.Fatalf("got %d receipts for two tags", len(both))
 	}
 
-	cap := RelayLimits{MaxReceipts: 2}
+	// The cap is per signer, so one recipient cannot fill the table.
+	cap2 := RelayLimits{MaxReceipts: 2}
 	for i := range 2 {
-		_ = db.PutReceipt(ctx, RelayReceipt{To: "alice", MsgID: fmt.Sprintf("m%d", i), Signer: "bob", EdPub: key(1), Sig: key(2), Expires: now.Add(time.Hour)}, cap)
+		_ = db.PutReceipt(ctx, RelayReceipt{Tag: fmt.Sprintf("d%d", i), MsgID: "m", Signer: "dave", EdPub: key(1), Sig: key(2), Expires: now.Add(time.Hour)}, cap2)
 	}
 	var q *QuotaError
-	if err := db.PutReceipt(ctx, RelayReceipt{To: "alice", MsgID: "over", Signer: "bob", EdPub: key(1), Sig: key(2), Expires: now.Add(time.Hour)}, cap); !errors.As(err, &q) {
+	if err := db.PutReceipt(ctx, RelayReceipt{Tag: "over", MsgID: "m", Signer: "dave", EdPub: key(1), Sig: key(2), Expires: now.Add(time.Hour)}, cap2); !errors.As(err, &q) {
 		t.Fatalf("receipt cap: %v", err)
+	}
+	if err := db.PutReceipt(ctx, RelayReceipt{Tag: "fine", MsgID: "m", Signer: "erin", EdPub: key(1), Sig: key(2), Expires: now.Add(time.Hour)}, cap2); err != nil {
+		t.Fatalf("another signer was blocked: %v", err)
+	}
+}
+
+func TestOutbox(t *testing.T) {
+	db := openDB(t)
+	now := time.Now()
+	add := func(msg, relay, to, tag string, age time.Duration) {
+		t.Helper()
+		if err := db.AddOutbox(ctx, OutboxEntry{MsgID: msg, RelayID: relay, To: to, Tag: tag, Created: now.Add(-age)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	add("m1", "relayA", "bob", "t1", time.Minute)
+	add("m1", "relayA", "bob", "t1", time.Minute) // idempotent
+	add("m1", "relayB", "bob", "t1", time.Minute)
+	add("m2", "relayA", "carol", "t2", time.Minute)
+	add("old", "relayA", "bob", "t3", 10*24*time.Hour)
+
+	got, err := db.Outbox(ctx, now.Add(-7*24*time.Hour))
+	if err != nil || len(got) != 3 {
+		t.Fatalf("outbox: %d %v", len(got), err)
+	}
+	if err := db.DeleteOutbox(ctx, "m1", "bob"); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := db.Outbox(ctx, now.Add(-7*24*time.Hour)); len(got) != 1 || got[0].MsgID != "m2" {
+		t.Fatalf("after receipt: %+v", got)
+	}
+	if n, err := db.PurgeOutbox(ctx, now.Add(-7*24*time.Hour)); err != nil || n != 1 {
+		t.Fatalf("purge: %d %v", n, err)
+	}
+}
+
+// A database at schema v4 (relay holding messages under the old column name)
+// upgrades in place to v5 and keeps what it was holding.
+func TestUpgradeFromSchemaV4KeepsHeldMessages(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "v4.db")
+	db := NewSQLiteDB(path)
+	if err := db.Connect(ctx); err != nil {
+		t.Fatal(err)
+	}
+	tx, _ := db.db.Begin()
+	for i := range 4 {
+		for _, stmt := range migrations[i] {
+			if _, err := tx.Exec(stmt); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	_, _ = tx.Exec(`PRAGMA user_version = 4`)
+	_, err := tx.Exec(`INSERT INTO relay_envelopes (id, from_peer, to_peer, blob, created, expires) VALUES ('e1', 'old-sender', 'bob', x'0102', 1, 99999999999999)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = tx.Commit()
+	db.Close()
+
+	up := openAt(t, path)
+	got, err := up.EnvelopesFor(ctx, "bob", time.Now(), 10)
+	if err != nil || len(got) != 1 || got[0].ID != "e1" || got[0].Submitter != "old-sender" {
+		t.Fatalf("held message lost or misread in the upgrade: %+v %v", got, err)
+	}
+	if err := up.AddOutbox(ctx, OutboxEntry{MsgID: "m", RelayID: "r", To: "t", Tag: "x", Created: time.Now()}); err != nil {
+		t.Fatalf("v5 tables missing: %v", err)
 	}
 }
 

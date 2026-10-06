@@ -43,14 +43,15 @@ const (
 	KindSecure      Kind = 9
 
 	// Offline delivery: prekey bundles and store-and-forward relaying.
-	KindPrekeys        Kind = 20 // our bundle, sent when a connection starts
-	KindBundleRequest  Kind = 21 // "do you hold a bundle for peer X?"
-	KindBundleResponse Kind = 22
-	KindRelayStore     Kind = 23 // sender -> relay: hold this for the recipient
-	KindRelayStored    Kind = 24 // relay -> sender: accepted or refused
-	KindRelayDeliver   Kind = 25 // relay -> recipient: here is a held message
-	KindRelayAck       Kind = 26 // recipient -> relay: got it (with a signed receipt)
-	KindRelayReceipt   Kind = 27 // relay -> sender: the recipient's signed receipt
+	KindPrekeys           Kind = 20 // our bundle, sent when a connection starts
+	KindBundleRequest     Kind = 21 // "do you hold a bundle for peer X?"
+	KindBundleResponse    Kind = 22
+	KindRelayRequest      Kind = 23 // anyone -> relay: a request sealed to the relay (store a message / fetch receipts)
+	KindRelayResponse     Kind = 24 // relay -> requester: the answer, sealed to a one-off key
+	KindRelayDeliver      Kind = 25 // relay -> recipient: here is a held message
+	KindRelayAck          Kind = 26 // recipient -> relay: dealt with it (with a signed receipt)
+	KindRelayForward      Kind = 27 // sender -> forwarder: pass this sealed request to a relay for me
+	KindRelayForwardReply Kind = 28 // forwarder -> sender: the relay's sealed answer, or a failure
 
 	KindFileOffer  Kind = 10
 	KindFileAccept Kind = 11
@@ -94,9 +95,9 @@ func MaxBody(k Kind) int {
 		return 16 << 10
 	case KindBundleRequest:
 		return 1 << 10
-	case KindRelayStore, KindRelayDeliver:
-		return 40 << 10 // a 24 KiB sealed message, base64-encoded inside JSON
-	case KindRelayStored, KindRelayAck, KindRelayReceipt:
+	case KindRelayRequest, KindRelayResponse, KindRelayDeliver, KindRelayForward, KindRelayForwardReply:
+		return 48 << 10 // a sealed message of up to ~24 KiB, base64-encoded inside JSON
+	case KindRelayAck:
 		return 4 << 10
 	case KindSecure:
 		// The largest inner frame, plus its kind byte and the ratchet's
@@ -120,8 +121,8 @@ func (k Kind) Application() bool {
 func (k Kind) known() bool {
 	switch k {
 	case KindHello, KindPing, KindRatchetInit, KindSecure,
-		KindPrekeys, KindBundleRequest, KindBundleResponse, KindRelayStore, KindRelayStored,
-		KindRelayDeliver, KindRelayAck, KindRelayReceipt, KindMessage, KindAck, KindGroupInvite, KindGroupInviteReply,
+		KindPrekeys, KindBundleRequest, KindBundleResponse, KindRelayRequest, KindRelayResponse,
+		KindRelayDeliver, KindRelayAck, KindRelayForward, KindRelayForwardReply, KindMessage, KindAck, KindGroupInvite, KindGroupInviteReply,
 		KindGroupUpdate, KindFileOffer, KindFileAccept, KindFileChunk, KindFileDone,
 		KindFileResult, KindFileAbort:
 		return true
@@ -310,44 +311,56 @@ type BundleResponse struct {
 	Bundle json.RawMessage `json:"bundle,omitempty"`
 }
 
-// RelayStore asks a relay to hold an end-to-end encrypted message for To. The
-// sender is the authenticated peer, so it is not repeated here.
-type RelayStore struct {
-	ID      string `json:"id"`
-	To      string `json:"to"`
-	Blob    []byte `json:"blob"`
-	Expires int64  `json:"expires"` // unix milliseconds
+// RelayRequest asks a relay to do something. Sealed is an anonymous box (see
+// package offline) addressed to the relay's signed prekey: whoever carries the
+// request - including a forwarder - cannot read it or tell who made it.
+type RelayRequest struct {
+	ID     string `json:"id"`
+	Sealed []byte `json:"sealed"`
 }
 
-// RelayStored is the relay's answer to a RelayStore.
-type RelayStored struct {
+// RelayResponse answers a RelayRequest. Sealed is addressed to a one-off key
+// the requester put in the request, so a forwarder cannot read it either.
+type RelayResponse struct {
+	ID     string `json:"id"`
+	Sealed []byte `json:"sealed"`
+}
+
+// RelayForward asks a peer to pass a sealed request on to Relay, so that the
+// relay sees the forwarder rather than the sender. The forwarder learns who
+// asked and which relay, but not what, nor for whom.
+type RelayForward struct {
+	ID     string `json:"id"`
+	Relay  string `json:"relay"`
+	Sealed []byte `json:"sealed"`
+}
+
+// RelayForwardReply returns the relay's sealed answer to the original asker, or
+// says why the request could not be passed on.
+type RelayForwardReply struct {
 	ID     string `json:"id"`
 	OK     bool   `json:"ok"`
 	Reason string `json:"reason,omitempty"`
+	Sealed []byte `json:"sealed,omitempty"`
 }
 
-// RelayDeliver hands a held message to its recipient.
+// RelayDeliver hands a held message to its recipient. There is no sender: a
+// relay does not know who wrote it.
 type RelayDeliver struct {
 	ID      string `json:"id"`
-	From    string `json:"from"`
 	Blob    []byte `json:"blob"`
 	Created int64  `json:"created"`
 }
 
 // RelayAck tells the relay the recipient has dealt with an envelope. When
-// Delivered, it carries the recipient's signed receipt for the sender.
+// Delivered, it carries the recipient's signed receipt and the mailbox Tag
+// (learned from inside the encrypted message) under which the sender will
+// look for it.
 type RelayAck struct {
 	ID        string `json:"id"`
 	Delivered bool   `json:"delivered"`
 	MsgID     string `json:"msg_id,omitempty"`
+	Tag       string `json:"tag,omitempty"`
 	EdPub     []byte `json:"ed,omitempty"`
 	Sig       []byte `json:"sig,omitempty"`
-}
-
-// RelayReceipt forwards a recipient's signed delivery receipt to the sender.
-type RelayReceipt struct {
-	MsgID  string `json:"msg_id"`
-	Signer string `json:"signer"`
-	EdPub  []byte `json:"ed"`
-	Sig    []byte `json:"sig"`
 }

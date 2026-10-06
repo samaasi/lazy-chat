@@ -238,6 +238,36 @@ var migrations = [][]string{
 		)`,
 		`CREATE INDEX idx_receipts_expires ON relay_receipts (expires)`,
 	},
+	{ // 5: sealed sender - the relay no longer knows who sent anything
+		// An envelope records who handed it over (the sender, or the forwarder
+		// that carried it for her), which a relay cannot tell apart.
+		`ALTER TABLE relay_envelopes RENAME COLUMN from_peer TO submitter`,
+		// Receipts used to be addressed to the sender's ID; they are now
+		// addressed to a random mailbox tag that only the sender and the
+		// recipient know. (Held receipts are transient, so none are kept.)
+		`DROP TABLE relay_receipts`,
+		`CREATE TABLE relay_receipts (
+			tag     TEXT NOT NULL,
+			msg_id  TEXT NOT NULL,
+			signer  TEXT NOT NULL,
+			ed_pub  BLOB NOT NULL,
+			sig     BLOB NOT NULL,
+			expires INTEGER NOT NULL,
+			PRIMARY KEY (tag, msg_id, signer)
+		)`,
+		`CREATE INDEX idx_receipts_signer ON relay_receipts (signer)`,
+		`CREATE INDEX idx_receipts_expires ON relay_receipts (expires)`,
+		// What we have queued with which relay, so we know whom to ask for receipts.
+		`CREATE TABLE relay_outbox (
+			msg_id   TEXT NOT NULL,
+			relay_id TEXT NOT NULL,
+			to_peer  TEXT NOT NULL,
+			tag      TEXT NOT NULL,
+			created  INTEGER NOT NULL,
+			PRIMARY KEY (msg_id, relay_id, to_peer)
+		)`,
+		`CREATE INDEX idx_outbox_created ON relay_outbox (created)`,
+	},
 }
 
 // legacyTables are the tables of the two incompatible schemas older versions
