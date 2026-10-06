@@ -298,7 +298,7 @@ func (m *Manager) releaseInbound(ip string) {
 func (m *Manager) handleInbound(conn net.Conn, ip string) {
 	tc := tls.Server(conn, m.tlsConfig(""))
 	release := func() { m.releaseInbound(ip) }
-	if _, err := m.establish(tc, "", false, ip, release); err != nil {
+	if _, err := m.establish(tc, "", false, ip, release, nil); err != nil {
 		m.logger.Debug("Inbound connection rejected", "remote_ip", ip, "error", err)
 		_ = conn.Close()
 		release()
@@ -308,10 +308,11 @@ func (m *Manager) handleInbound(conn net.Conn, ip string) {
 // ---- Establishing ----------------------------------------------------------
 
 // establish completes the TLS handshake, exchanges Hello frames, and registers
-// the connection. On success the connection's goroutines are running. If a
+// the connection. identified, when set, runs once the peer is authenticated
+// and before anyone is told it connected. On success the connection's goroutines are running. If a
 // connection to the same peer already exists and wins, the new one is closed
 // and the existing one is returned.
-func (m *Manager) establish(tc *tls.Conn, expectedID string, outbound bool, ip string, release func()) (*peerConn, error) {
+func (m *Manager) establish(tc *tls.Conn, expectedID string, outbound bool, ip string, release func(), identified func(id, name string)) (*peerConn, error) {
 	ctx, cancel := context.WithTimeout(m.ctx, m.opts.HandshakeTimeout)
 	defer cancel()
 	// Unblocks the Hello exchange (plain deadline-based I/O) on Stop or timeout.
@@ -354,6 +355,9 @@ func (m *Manager) establish(tc *tls.Conn, expectedID string, outbound bool, ip s
 		return nil, fmt.Errorf("ratchet: %w", err)
 	}
 
+	if identified != nil {
+		identified(pc.id, pc.name)
+	}
 	winner, err := m.register(pc)
 	if err != nil {
 		return nil, err
@@ -648,7 +652,7 @@ func (m *Manager) dial(ctx context.Context, peerID string) error {
 	}
 
 	tc := tls.Client(raw, m.tlsConfig(peerID))
-	if _, err := m.establish(tc, peerID, true, "", nil); err != nil {
+	if _, err := m.establish(tc, peerID, true, "", nil, nil); err != nil {
 		_ = raw.Close()
 		return apperrors.Wrap(err, apperrors.ErrorTypeNetwork, "NET001", "failed to establish secure connection").
 			WithContext("peer_id", peerID)

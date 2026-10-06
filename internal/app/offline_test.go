@@ -85,10 +85,13 @@ func itoa(n int) string { return strconv.Itoa(n) }
 
 // reopen stops an instance and starts a new one with the same keys, database
 // and ports: a laptop being closed and opened again.
-func reopen(t *testing.T, old *instance) *instance {
+func reopen(t *testing.T, old *instance, mods ...func(*config.Config)) *instance {
 	t.Helper()
 	cfg := *old.app.config
 	old.app.Stop()
+	for _, f := range mods {
+		f(&cfg)
+	}
 
 	pr, pw := io.Pipe()
 	out := &syncBuf{}

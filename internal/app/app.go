@@ -93,6 +93,7 @@ type App struct {
 
 	firewall       *firewall.Guard
 	firewallRemind bool
+	book           *peerBook // nil when remember_peers is off
 
 	id *identity.Identity
 
@@ -245,6 +246,13 @@ func New(cfg *config.Config, opts ...Option) (_ *App, err error) {
 	if o.firewall != nil { // never a typed nil in the interface
 		a.cli.Firewall = o.firewall
 	}
+	a.cli.Book = db
+	if cfg.RememberPeers {
+		a.book = &peerBook{store: db, peers: peers, net: netMgr, logger: log, now: time.Now, ctx: ctx, wg: &a.wg}
+		netMgr.AddListener(a.book)
+	} else if err := db.ForgetAllPeers(ctx); err != nil {
+		log.Debug("Could not forget remembered peers", "error", err)
+	}
 	return a, nil
 }
 
@@ -295,6 +303,10 @@ func (a *App) Start() error {
 	if a.updateNotice != nil {
 		a.wg.Add(1)
 		go a.announceUpdate()
+	}
+	if a.book != nil {
+		a.wg.Add(1)
+		go a.book.run()
 	}
 	if a.firewall != nil && a.firewallRemind {
 		a.wg.Add(1)

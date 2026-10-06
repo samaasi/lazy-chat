@@ -41,13 +41,15 @@ func (m *Manager) ConnectToAddress(ctx context.Context, t address.Target) (peerI
 		return "", "", apperrors.Wrap(err, apperrors.ErrorTypeNetwork, "NET001", "failed to connect to "+addr)
 	}
 	tc := tls.Client(raw, m.tlsConfig(t.ID))
-	pc, err := m.establish(tc, t.ID, true, "", nil)
+	// Record where the peer is before announcing it, so listeners (the peer
+	// book, /list) already know its address when they hear it connected.
+	remember := func(id, name string) {
+		m.peers.AddPeer(&models.Peer{ID: id, Username: name, Address: t.Host, Port: t.Port, LastSeen: time.Now()})
+	}
+	pc, err := m.establish(tc, t.ID, true, "", nil, remember)
 	if err != nil {
 		_ = raw.Close()
 		return "", "", apperrors.Wrap(err, apperrors.ErrorTypeNetwork, "NET001", "failed to establish secure connection to "+addr)
 	}
-
-	// Remember where it is, so it shows in /list and can be reached by name.
-	m.peers.AddPeer(&models.Peer{ID: pc.id, Username: pc.name, Address: t.Host, Port: t.Port, LastSeen: time.Now()})
 	return pc.id, pc.name, nil
 }

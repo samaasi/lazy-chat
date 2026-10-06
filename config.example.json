@@ -18,6 +18,7 @@
   "sealed_sender": "auto",
   "update_check": true,
   "peers": [],
+  "remember_peers": true,
   "download_dir": "downloads",
   "max_file_size": 268435456,
   "auto_accept_files": false

@@ -275,6 +275,16 @@ var migrations = [][]string{
 		)`,
 		`CREATE INDEX idx_outbox_created ON relay_outbox (created)`,
 	},
+	{ // 6: peers we have connected to, so they can be reached again without discovery
+		`CREATE TABLE known_peers (
+			id             TEXT PRIMARY KEY,
+			username       TEXT NOT NULL,
+			address        TEXT NOT NULL,
+			port           INTEGER NOT NULL,
+			last_connected INTEGER NOT NULL
+		)`,
+		`CREATE INDEX idx_known_peers_last ON known_peers (last_connected)`,
+	},
 }
 
 // legacyTables are the tables of the two incompatible schemas older versions

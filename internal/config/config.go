@@ -45,6 +45,7 @@ type Config struct {
 	RelayMaxStorage      int64           `json:"relay_max_storage"` // bytes of other peers' messages held at most
 	SealedSender         string          `json:"sealed_sender"`     // auto or required: hide who queues a message from relays
 	Peers                []string        `json:"peers"`             // addresses to connect to at start-up, for networks where discovery does not reach: host[:port] or <peer id>@host[:port]
+	RememberPeers        bool            `json:"remember_peers"`    // keep connected peers' addresses and reconnect to them
 	UpdateCheck          bool            `json:"update_check"`      // tell me at start-up when a new release exists (never installs it)
 	DownloadDir          string          `json:"download_dir"`
 	MaxFileSize          int64           `json:"max_file_size"`     // bytes accepted per incoming file
@@ -116,6 +117,7 @@ func DefaultConfig() *Config {
 		RelayMaxStorage:   64 << 20,
 		SealedSender:      "auto",
 		UpdateCheck:       true,
+		RememberPeers:     true,
 		DownloadDir:       "downloads",
 		MaxFileSize:       256 << 20,
 		Database:          &DatabaseConfig{},
@@ -200,6 +202,7 @@ func (c *Config) loadFromEnv(getenv func(string) string) error {
 		{"P2P_RELAY_MAX_STORAGE", &c.RelayMaxStorage},
 		{"P2P_SEALED_SENDER", &c.SealedSender},
 		{"P2P_UPDATE_CHECK", &c.UpdateCheck},
+		{"P2P_REMEMBER_PEERS", &c.RememberPeers},
 		{"P2P_DOWNLOAD_DIR", &c.DownloadDir},
 		{"P2P_MAX_FILE_SIZE", &c.MaxFileSize},
 		{"P2P_AUTO_ACCEPT_FILES", &c.AutoAcceptFiles},
@@ -277,6 +280,7 @@ func (c *Config) loadFromFlags(args []string) error {
 		c.Peers = append(c.Peers, v)
 		return nil
 	})
+	fs.BoolVar(&c.RememberPeers, "remember-peers", c.RememberPeers, "Remember where connected peers are and reconnect to them (--remember-peers=false to disable)")
 	fs.BoolVar(&c.UpdateCheck, "update-check", c.UpdateCheck, "Check GitHub once a day for a new release and say so (--update-check=false to disable)")
 	fs.StringVar(&c.SealedSender, "sealed-sender", c.SealedSender, "Offline delivery privacy: auto or required")
 	str(&c.DownloadDir, "download-dir", "Directory for downloaded files")
@@ -317,6 +321,8 @@ Options:
       --relay-max-storage <n>   Most bytes of other peers' messages to hold (default 67108864)
       --peer <address>          Connect to host[:port] or <peer id>@host[:port] at start-up, when
                                 discovery cannot reach it; repeat for several (config: "peers")
+      --remember-peers=false    Do not remember where peers were or reconnect to them; forgets those
+                                already remembered (default on)
       --update-check=false      Do not look for new releases at start-up (default on, once a day)
       --sealed-sender <mode>    auto: queue offline messages even when a relay can see you are the sender
                                 (you are told); required: only queue them anonymously (default auto)

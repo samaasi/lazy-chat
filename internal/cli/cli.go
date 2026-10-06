@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"slices"
 	"strconv"
@@ -48,6 +49,7 @@ type Deps struct {
 	Net       interfaces.NetworkManager
 	Dialer    AddressDialer
 	Firewall  FirewallGuard
+	Book      storage.PeerBook
 	Handler   *messaging.Handler
 	Groups    *services.GroupService
 	History   *services.MessageHistoryService
@@ -249,6 +251,7 @@ func (c *CLI) buildCommands() []command {
 		{[]string{"/search"}, "<text>", "Search message history", c.cmdSearch},
 		{[]string{"/export"}, "<peer|group> <file> [text|json]", "Export a conversation to a new file", c.cmdExport},
 		{[]string{"/relay"}, "", "Show messages held for offline peers", c.cmdRelay},
+		{[]string{"/forget"}, "<peer>", "Stop remembering a peer's address (it will not be reconnected automatically)", c.cmdForget},
 		{[]string{"/firewall"}, "", "Let other peers find and reach you through the firewall", c.cmdFirewall},
 		{[]string{"/status", "/st"}, "", "Show application status", c.cmdStatus},
 		{[]string{"/quit", "/exit", "/q"}, "", "Exit", func(context.Context, string) error {
@@ -566,6 +569,39 @@ func (c *CLI) cmdConnections(ctx context.Context, _ string) error {
 	}
 	c.Console.Printf("Active connections (%d), all encrypted and authenticated:", len(ids))
 	c.table("NAME\tID\tADDRESS\tTRUST", rows)
+	return nil
+}
+
+func (c *CLI) cmdForget(ctx context.Context, arg string) error {
+	if arg == "" {
+		return errUsage
+	}
+	if c.Book == nil {
+		return errors.New("remembered peers are not available")
+	}
+	known, err := c.Book.KnownPeers(ctx, time.Time{}, 1000)
+	if err != nil {
+		return err
+	}
+	q := strings.ToLower(strings.TrimSpace(arg))
+	var match []storage.KnownPeer
+	for _, p := range known {
+		if p.ID == q || (len(q) >= 4 && strings.HasPrefix(p.ID, q)) || strings.EqualFold(p.Username, q) {
+			match = append(match, p)
+		}
+	}
+	switch len(match) {
+	case 0:
+		return fmt.Errorf("no remembered peer matches %q", arg)
+	case 1:
+	default:
+		return fmt.Errorf("%q matches %d remembered peers; use a longer ID prefix", arg, len(match))
+	}
+	if _, err := c.Book.ForgetPeer(ctx, match[0].ID); err != nil {
+		return err
+	}
+	c.Console.Printf("Forgot %s (%s at %s). It will not be reconnected automatically.", clean(match[0].Username, 32), match[0].ID[:8],
+		net.JoinHostPort(match[0].Address, strconv.Itoa(match[0].Port)))
 	return nil
 }
 
