@@ -555,14 +555,21 @@ func (c *CLI) cmdSend(ctx context.Context, arg string) error {
 		return err
 	}
 	err = c.Handler.SendMessage(ctx, id, parts[1])
-	note := ""
+	note, warn := "", ""
 	switch {
 	case messaging.IsQueued(err):
 		note = "  (offline: queued with relays, delivered when they return)"
+		var q *messaging.QueuedError
+		if errors.As(err, &q) && q.Exposed > 0 {
+			warn = fmt.Sprintf("  ! %d relay(s) could see that this is from you: too few peers are connected to hide it", q.Exposed)
+		}
 	case err != nil:
 		return err
 	}
 	c.Console.Printf("[%s] you -> %s: %s%s", time.Now().Format("15:04:05"), c.name(id), clean(parts[1], 0), note)
+	if warn != "" {
+		c.Console.Printf("%s", warn)
+	}
 	return nil
 }
 

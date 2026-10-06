@@ -180,7 +180,7 @@ func New(cfg *config.Config, opts ...Option) (_ *App, err error) {
 	groups := services.NewGroupService(db, db, id.ID(), cfg.Username)
 	history := services.NewMessageHistoryService(db, db, id.ID())
 
-	relayMgr := relay.NewManager(relay.Options{Enabled: cfg.Relay, MaxStorage: cfg.RelayMaxStorage}, relay.Deps{
+	relayMgr := relay.NewManager(relay.Options{Enabled: cfg.Relay, MaxStorage: cfg.RelayMaxStorage, RequireAnonymous: cfg.SealedSender == "required"}, relay.Deps{
 		Logger: log, Self: id, Net: netMgr, Offline: offline.NewService(id, db), Store: db,
 	})
 	handler := messaging.NewHandler(messaging.Deps{

@@ -74,6 +74,7 @@ func TestBadValuesAreRejected(t *testing.T) {
 		"long name":          {args: []string{"-u", strings.Repeat("a", 33)}},
 		"bad broadcast":      {args: []string{"--broadcast-addr", "not-an-ip"}},
 		"range overflow":     {args: []string{"--discovery-port", "65530", "--discovery-range", "20"}},
+		"bad sealed sender":  {args: []string{"--sealed-sender", "sometimes"}},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -108,5 +109,16 @@ func TestDefaultConfigHasNoSideEffects(t *testing.T) {
 	DefaultConfig()
 	if entries, _ := os.ReadDir(home); len(entries) != 0 {
 		t.Fatalf("DefaultConfig created files: %v", entries)
+	}
+}
+
+func TestSealedSenderDefaultsToAutoAndIsCaseInsensitive(t *testing.T) {
+	c, err := Load(nil, env(nil))
+	if err != nil || c.SealedSender != "auto" {
+		t.Fatalf("default: %q %v", c.SealedSender, err)
+	}
+	c, err = Load([]string{"--sealed-sender", "REQUIRED"}, env(nil))
+	if err != nil || c.SealedSender != "required" {
+		t.Fatalf("required: %q %v", c.SealedSender, err)
 	}
 }

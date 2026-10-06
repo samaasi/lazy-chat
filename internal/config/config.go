@@ -42,6 +42,7 @@ type Config struct {
 	PassphraseFile       string          `json:"passphrase_file"`   // file holding the passphrase, for unattended start-up
 	Relay                bool            `json:"relay"`             // hold encrypted messages for offline peers
 	RelayMaxStorage      int64           `json:"relay_max_storage"` // bytes of other peers' messages held at most
+	SealedSender         string          `json:"sealed_sender"`     // auto or required: hide who queues a message from relays
 	DownloadDir          string          `json:"download_dir"`
 	MaxFileSize          int64           `json:"max_file_size"`     // bytes accepted per incoming file
 	AutoAcceptFiles      bool            `json:"auto_accept_files"` // otherwise /getfile is required
@@ -110,6 +111,7 @@ func DefaultConfig() *Config {
 		Encryption:        "auto",
 		Relay:             true,
 		RelayMaxStorage:   64 << 20,
+		SealedSender:      "auto",
 		DownloadDir:       "downloads",
 		MaxFileSize:       256 << 20,
 		Database:          &DatabaseConfig{},
@@ -192,6 +194,7 @@ func (c *Config) loadFromEnv(getenv func(string) string) error {
 		{"P2P_PASSPHRASE_FILE", &c.PassphraseFile},
 		{"P2P_RELAY", &c.Relay},
 		{"P2P_RELAY_MAX_STORAGE", &c.RelayMaxStorage},
+		{"P2P_SEALED_SENDER", &c.SealedSender},
 		{"P2P_DOWNLOAD_DIR", &c.DownloadDir},
 		{"P2P_MAX_FILE_SIZE", &c.MaxFileSize},
 		{"P2P_AUTO_ACCEPT_FILES", &c.AutoAcceptFiles},
@@ -256,6 +259,7 @@ func (c *Config) loadFromFlags(args []string) error {
 	str(&c.PassphraseFile, "passphrase-file", "File containing the passphrase")
 	fs.BoolVar(&c.Relay, "relay", c.Relay, "Hold encrypted messages for offline peers (--relay=false to disable)")
 	fs.Int64Var(&c.RelayMaxStorage, "relay-max-storage", c.RelayMaxStorage, "Most bytes of other peers' messages to hold")
+	fs.StringVar(&c.SealedSender, "sealed-sender", c.SealedSender, "Offline delivery privacy: auto or required")
 	str(&c.DownloadDir, "download-dir", "Directory for downloaded files")
 	fs.Int64Var(&c.MaxFileSize, "max-file-size", c.MaxFileSize, "Largest incoming file in bytes")
 	fs.BoolVar(&c.AutoAcceptFiles, "auto-accept-files", c.AutoAcceptFiles, "Accept incoming files without confirmation")
@@ -292,6 +296,8 @@ Options:
       --passphrase-file <file>  Read the passphrase from this file instead of asking
       --relay=false             Do not hold encrypted messages for offline peers (default on)
       --relay-max-storage <n>   Most bytes of other peers' messages to hold (default 67108864)
+      --sealed-sender <mode>    auto: queue offline messages even when a relay can see you are the sender
+                                (you are told); required: only queue them anonymously (default auto)
       --download-dir <dir>      Where received files are saved (default downloads)
       --max-file-size <bytes>   Largest incoming file (default 268435456)
       --auto-accept-files       Accept incoming files without confirmation
@@ -361,6 +367,11 @@ func (c *Config) Validate() error {
 	}
 	if c.RelayMaxStorage < 1<<20 || c.RelayMaxStorage > 64<<30 {
 		return invalid("relay_max_storage", c.RelayMaxStorage, "must be between 1 MiB and 64 GiB")
+	}
+	switch c.SealedSender = strings.ToLower(c.SealedSender); c.SealedSender {
+	case "auto", "required":
+	default:
+		return invalid("sealed_sender", c.SealedSender, "must be auto or required")
 	}
 	switch strings.ToLower(c.Encryption) {
 	case "auto", "passphrase", "os", "off":
