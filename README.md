@@ -80,6 +80,7 @@ lazy-chat -u Bob   -p 8081 --data-dir /tmp/bob
 | `/whoami` | Show your name and peer ID |
 | `/list`, `/connections` | Peers and connections, with their trust status |
 | `/connect <peer>`, `/disconnect <peer>` | Manage connections (sending a message connects automatically) |
+| `/connect <host>[:<port>]`, `/connect <id>@<host>[:<port>]` | Connect by address when discovery cannot find the peer (see [When peers don't appear](#when-peers-dont-appear)) |
 | `/send <peer> <message>` | Send a message |
 | `/safety <peer>` | Show the safety number to compare with that peer |
 | `/verify <peer>`, `/unverify <peer>` | Record that you compared safety numbers |
@@ -111,6 +112,7 @@ The config file is `./config.json` if present, or the path given with `-c/--conf
 | `--max-connections` / `max_connections` | `64` | Simultaneous inbound connections |
 | `--discovery-port`, `--discovery-range` | `9999`, `10` | First UDP port and how many to use |
 | `--broadcast-addr`, `--broadcast-interval` | `255.255.255.255`, `5` | Where and how often to announce |
+| `--peer` / `peers` / `P2P_PEERS` | none | Addresses to connect to at start-up, retried for a few minutes: `host[:port]` or `<peer id>@host[:port]`. Repeat the flag, or comma-separate the variable |
 | `--data-dir` / `data_dir` | `~/.lazy-chat` | Identity key, key vault and database |
 | `--db-path` / `database.path` | `<data-dir>/lazy-chat.db` | SQLite database |
 | `--encryption` / `encryption` | `auto` | `auto`, `passphrase`, `os` or `off` |
@@ -125,7 +127,7 @@ The config file is `./config.json` if present, or the path given with `-c/--conf
 | `--notifications` / `notifications_enabled` | off | Desktop notifications |
 | `--log-level`, `--log-format`, `--log-file` | `info`, `text`, stderr | Logging (files rotate at 10 MiB) |
 
-If peers cannot see each other, set `--broadcast-addr` to your subnet's broadcast address (for example `192.168.1.255`); some systems send the limited broadcast out of only one network adapter.
+If peers cannot see each other, set `--broadcast-addr` to your subnet's broadcast address (for example `192.168.1.255`); some systems send the limited broadcast out of only one network adapter. If that does not help either, [connect by address](#when-peers-dont-appear).
 
 ### Encryption at rest
 
@@ -281,6 +283,21 @@ GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o lazy-chat-linux-arm64 ./cmd/la
 ```
 
 ## Troubleshooting
+
+### When peers don't appear
+
+A peer ID is a fingerprint of a key, not an address, so the app can only reach peers it has *discovered* (the UDP announcements shown in `/list`). Commands naming a peer that was never discovered fail with `peer not found`, followed by a hint.
+
+If broadcasts do not get through (a different subnet, a VPN, guest Wi-Fi, a blocked firewall), connect by address instead:
+
+```
+> /connect 192.168.1.20            # port 8080 unless you give one: 192.168.1.20:9000
+> /connect d033d57d674e975564c47731bb6b2503@192.168.1.20
+```
+
+or at start-up (`--peer 192.168.1.20`, or `"peers": ["192.168.1.20"]` in the configuration), which keeps retrying until the other side is up. The connection is as secure as any other (TLS 1.3 with mutual keys, then the ratchet), and the peer is added to `/list` so you can use its name. What differs is trust: when you give only an address, whoever answers there is accepted, so confirm their identity with `/safety` afterwards. When you give `<id>@address`, only that exact peer is accepted, and anyone else answering is refused. Both machines still need to reach each other's TCP port (8080 by default), so allow it in the firewall.
+
+### Other problems
 
 - **Peers don't appear**: allow UDP ports 9999-10008 and your TCP port through the firewall, make sure both machines are on the same subnet, and try `--broadcast-addr` with the subnet broadcast address.
 - **Address already in use**: pick another `--port`; discovery automatically takes the next free UDP port in its range.
