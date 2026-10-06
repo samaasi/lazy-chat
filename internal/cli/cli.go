@@ -48,6 +48,7 @@ type Deps struct {
 	Groups    *services.GroupService
 	History   *services.MessageHistoryService
 	Files     *filetransfer.Manager
+	Verify    storage.VerificationStorage
 	StartedAt time.Time
 	Version   string
 }
@@ -195,6 +196,9 @@ func (c *CLI) buildCommands() []command {
 		{[]string{"/help", "/h"}, "", "Show this help", func(context.Context, string) error { c.printHelp(); return nil }},
 		{[]string{"/whoami", "/me"}, "", "Show your name and peer ID", c.cmdWhoami},
 		{[]string{"/list", "/l"}, "", "List discovered peers", c.cmdList},
+		{[]string{"/safety"}, "<peer>", "Show the safety number to compare with a peer", c.cmdSafety},
+		{[]string{"/verify"}, "<peer>", "Mark a peer as verified after comparing safety numbers", c.cmdVerify},
+		{[]string{"/unverify"}, "<peer>", "Remove a peer's verified mark", c.cmdUnverify},
 		{[]string{"/connect", "/c"}, "<peer>", "Connect to a peer", c.cmdConnect},
 		{[]string{"/disconnect"}, "<peer>", "Close the connection to a peer", c.cmdDisconnect},
 		{[]string{"/connections", "/conn"}, "", "List active connections", c.cmdConnections},
@@ -331,6 +335,82 @@ func clean(s string, max int) string { return utils.SanitizeText(s, max) }
 
 // ---- Peers and connections -----------------------------------------------
 
+func (c *CLI) verifiedSet(ctx context.Context) map[string]time.Time {
+	if c.Verify == nil {
+		return nil
+	}
+	set, err := c.Verify.ListVerified(ctx)
+	if err != nil {
+		return nil
+	}
+	return set
+}
+
+func (c *CLI) trust(verified map[string]time.Time, id string) string {
+	if _, ok := verified[id]; ok {
+		return "verified"
+	}
+	return "unverified"
+}
+
+// ---- Safety numbers -------------------------------------------------------
+
+func (c *CLI) cmdSafety(ctx context.Context, arg string) error {
+	if arg == "" {
+		return errUsage
+	}
+	id, err := c.resolvePeer(arg)
+	if err != nil {
+		return err
+	}
+	groups := strings.Fields(identity.SafetyNumber(c.SelfID, id))
+	status := "NOT verified"
+	if c.Verify != nil {
+		if ok, _ := c.Verify.IsVerified(ctx, id); ok {
+			status = "verified"
+		}
+	}
+	c.Console.Printf("Safety number with %s (%s):", c.name(id), status)
+	c.Console.Printf("")
+	c.Console.Printf("    %s", strings.Join(groups[:6], "  "))
+	c.Console.Printf("    %s", strings.Join(groups[6:], "  "))
+	c.Console.Printf("")
+	c.Console.Printf("Both of you should see exactly this number. Compare it in person or over a")
+	c.Console.Printf("call you trust (not in this chat). If it matches, run: /verify %s", id[:8])
+	c.Console.Printf("If it differs, someone is impersonating one of you - do not trust this peer.")
+	return nil
+}
+
+func (c *CLI) cmdVerify(ctx context.Context, arg string) error {
+	return c.setVerified(ctx, arg, true)
+}
+
+func (c *CLI) cmdUnverify(ctx context.Context, arg string) error {
+	return c.setVerified(ctx, arg, false)
+}
+
+func (c *CLI) setVerified(ctx context.Context, arg string, verified bool) error {
+	if arg == "" {
+		return errUsage
+	}
+	if c.Verify == nil {
+		return errors.New("verification is not available")
+	}
+	id, err := c.resolvePeer(arg)
+	if err != nil {
+		return err
+	}
+	if err := c.Verify.SetVerified(ctx, id, verified); err != nil {
+		return err
+	}
+	if verified {
+		c.Console.Printf("%s is now marked verified. Only do this after comparing the safety number (/safety).", c.name(id))
+	} else {
+		c.Console.Printf("%s is no longer marked verified.", c.name(id))
+	}
+	return nil
+}
+
 func (c *CLI) cmdWhoami(context.Context, string) error {
 	c.Console.Printf("Name:    %s", c.SelfName)
 	c.Console.Printf("Peer ID: %s", c.SelfID)
@@ -349,7 +429,8 @@ func (c *CLI) table(header string, rows [][]string) {
 	c.Console.Printf("%s", strings.TrimRight(b.String(), "\n"))
 }
 
-func (c *CLI) cmdList(context.Context, string) error {
+func (c *CLI) cmdList(ctx context.Context, _ string) error {
+	verified := c.verifiedSet(ctx)
 	peers := c.Peers.Peers()
 	if len(peers) == 0 {
 		c.Console.Printf("No peers discovered yet.")
@@ -362,10 +443,10 @@ func (c *CLI) cmdList(context.Context, string) error {
 			state = "connected"
 		}
 		rows = append(rows, []string{clean(p.Username, 32), p.ID[:8], p.NetworkAddress(),
-			time.Since(p.LastSeen).Truncate(time.Second).String() + " ago", state})
+			time.Since(p.LastSeen).Truncate(time.Second).String() + " ago", state, c.trust(verified, p.ID)})
 	}
 	c.Console.Printf("Discovered peers (%d):", len(peers))
-	c.table("NAME\tID\tADDRESS\tLAST SEEN\t", rows)
+	c.table("NAME\tID\tADDRESS\tLAST SEEN\tSTATE\tTRUST", rows)
 	return nil
 }
 
@@ -404,7 +485,8 @@ func (c *CLI) cmdDisconnect(_ context.Context, arg string) error {
 	return nil
 }
 
-func (c *CLI) cmdConnections(context.Context, string) error {
+func (c *CLI) cmdConnections(ctx context.Context, _ string) error {
+	verified := c.verifiedSet(ctx)
 	ids := c.Net.ConnectedPeers()
 	if len(ids) == 0 {
 		c.Console.Printf("No active connections.")
@@ -417,10 +499,10 @@ func (c *CLI) cmdConnections(context.Context, string) error {
 		if p, ok := c.Peers.GetPeer(id); ok {
 			addr = p.NetworkAddress()
 		}
-		rows = append(rows, []string{clean(name, 32), id[:8], addr})
+		rows = append(rows, []string{clean(name, 32), id[:8], addr, c.trust(verified, id)})
 	}
 	c.Console.Printf("Active connections (%d), all encrypted and authenticated:", len(ids))
-	c.table("NAME\tID\tADDRESS", rows)
+	c.table("NAME\tID\tADDRESS\tTRUST", rows)
 	return nil
 }
 

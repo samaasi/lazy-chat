@@ -11,6 +11,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/sha512"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -21,6 +22,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -186,4 +188,27 @@ func PeerIDFromCertificate(der []byte) (string, error) {
 		return "", errors.New("peer certificate does not use an Ed25519 key")
 	}
 	return PeerIDFromPublicKey(pub), nil
+}
+
+// SafetyNumber returns a short number two peers can compare out of band
+// (read aloud, or side by side) to confirm they are talking to each other and
+// not to an impostor. Both peers compute the same value: it is derived from
+// the pair of peer IDs, which are fingerprints of the public keys, so it
+// changes if either key does. The result is 60 digits in 12 groups of five.
+func SafetyNumber(idA, idB string) string {
+	lo, hi := idA, idB
+	if lo > hi {
+		lo, hi = hi, lo
+	}
+	sum := sha512.Sum512([]byte("lazy-chat/safety/v1|" + lo + "|" + hi))
+
+	groups := make([]string, 12)
+	for i := range groups {
+		var v uint64
+		for _, b := range sum[i*5 : i*5+5] {
+			v = v<<8 | uint64(b)
+		}
+		groups[i] = fmt.Sprintf("%05d", v%100000)
+	}
+	return strings.Join(groups, " ")
 }

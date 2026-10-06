@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/samaasi/lazy-chat/internal/config"
+	"github.com/samaasi/lazy-chat/internal/identity"
 )
 
 // ---- Harness ---------------------------------------------------------------
@@ -460,5 +461,42 @@ func TestNewFailsCleanlyOnBadConfig(t *testing.T) {
 	cfg.LogLevel = "error"
 	if _, err := New(cfg, WithIO(strings.NewReader(""), &syncBuf{})); err == nil {
 		t.Fatal("unusable database path accepted")
+	}
+}
+
+func TestSafetyNumbersMatchAndVerificationSticks(t *testing.T) {
+	alice, bob := pair(t)
+	groups := strings.Fields(identity.SafetyNumber(alice.app.ID(), bob.app.ID()))
+	line1, line2 := strings.Join(groups[:6], "  "), strings.Join(groups[6:], "  ")
+
+	// Each side shows the identical number.
+	alice.say("/safety bob")
+	alice.waitOut(line1, line2, "NOT verified")
+	bob.say("/safety alice")
+	bob.waitOut(line1, line2, "NOT verified")
+
+	alice.say("/list")
+	alice.waitOut("unverified")
+
+	alice.say("/verify bob")
+	alice.waitOut("now marked verified")
+	alice.say("/safety bob")
+	alice.waitOut("(verified)")
+	alice.say("/connections")
+	alice.say("/send bob hello") // connect, so /connections has a row
+	bob.waitOut("hello")
+	alice.say("/connections")
+	alice.waitOut("verified")
+
+	// It is Alice's local judgement: Bob has not verified Alice.
+	bob.say("/list")
+	bob.waitOut("unverified")
+
+	alice.say("/unverify bob")
+	alice.waitOut("no longer marked verified")
+	alice.say("/safety bob")
+	time.Sleep(100 * time.Millisecond)
+	if strings.Count(alice.out.String(), "NOT verified") < 2 {
+		t.Fatalf("unverify did not take effect:\n%s", alice.out.String())
 	}
 }

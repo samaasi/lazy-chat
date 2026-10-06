@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -143,5 +144,27 @@ func TestMutualTLSYieldsPeerIDs(t *testing.T) {
 	}
 	if got := <-seen; got != client.ID() {
 		t.Fatalf("server saw client ID %q, want %s", got, client.ID())
+	}
+}
+
+func TestSafetyNumber(t *testing.T) {
+	a, b, c := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "cccccccccccccccccccccccccccccccc"
+	ab, ba := SafetyNumber(a, b), SafetyNumber(b, a)
+	if ab != ba {
+		t.Fatalf("both peers must compute the same number: %q vs %q", ab, ba)
+	}
+	if got := strings.Fields(ab); len(got) != 12 {
+		t.Fatalf("want 12 groups, got %q", ab)
+	}
+	for _, g := range strings.Fields(ab) {
+		if len(g) != 5 {
+			t.Fatalf("group %q is not 5 digits", g)
+		}
+	}
+	if ab == SafetyNumber(a, c) || ab == SafetyNumber(b, c) {
+		t.Fatal("different peer pairs must give different numbers")
+	}
+	if SafetyNumber(a, b) != ab {
+		t.Fatal("not deterministic")
 	}
 }

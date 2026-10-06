@@ -171,7 +171,7 @@ func New(cfg *config.Config, opts ...Option) (_ *App, err error) {
 	}
 	a.cli = cli.New(cli.Deps{
 		In: o.in, Console: console, SelfID: id.ID(), SelfName: cfg.Username,
-		Peers: peers, Net: netMgr, Handler: handler, Groups: groups, History: history, Files: files,
+		Peers: peers, Net: netMgr, Handler: handler, Groups: groups, History: history, Files: files, Verify: db,
 		StartedAt: time.Now(), Version: o.version,
 	})
 	return a, nil
