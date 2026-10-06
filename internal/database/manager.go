@@ -9,7 +9,7 @@ import (
 	"github.com/samaasi/lazy-chat/internal/config"
 	"github.com/samaasi/lazy-chat/internal/storage"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 )
 
 // Manager handles database connections and initialization

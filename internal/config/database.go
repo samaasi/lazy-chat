@@ -117,12 +117,12 @@ func (dc *DatabaseConfig) Validate() error {
 func (dc *DatabaseConfig) GetDriverName() string {
 	switch dc.Type {
 	case "sqlite":
-		return "sqlite3"
+		return "sqlite"
 	case "postgres":
 		return "postgres"
 	case "mysql":
 		return "mysql"
 	default:
-		return "sqlite3"
+		return "sqlite"
 	}
 }

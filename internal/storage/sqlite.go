@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 	"github.com/samaasi/lazy-chat/internal/models"
 )
 
@@ -26,7 +26,7 @@ func NewSQLiteDB(path string) *SQLiteDB {
 
 // Connect establishes database connection
 func (s *SQLiteDB) Connect(ctx context.Context) error {
-	db, err := sql.Open("sqlite3", s.path)
+	db, err := sql.Open("sqlite", s.path)
 	if err != nil {
 		return fmt.Errorf("failed to open database: %w", err)
 	}

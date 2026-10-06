@@ -5,128 +5,143 @@ on:
     branches: [ master, develop ]
     tags: [ 'v*' ]
   pull_request:
-    branches: [ master ]
+    branches: [ master, develop ]
   workflow_dispatch:
 
+# Least privilege by default; the release job opts in to what it needs.
+permissions:
+  contents: read
+
+env:
+  GOFLAGS: -mod=readonly
+
 jobs:
-  build:
-    name: Build for ${{ matrix.os }}-${{ matrix.arch }}
+  test:
+    name: Test (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ ubuntu-latest, windows-latest, macos-latest ]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+
+      - name: Vet
+        run: go vet ./...
+
+      # -race needs cgo; the shipped binaries are built without it below.
+      - name: Test (race detector)
+        env:
+          CGO_ENABLED: 1
+        run: go test -race -count=1 ./...
+
+      - name: Test (release configuration, no cgo)
+        env:
+          CGO_ENABLED: 0
+        run: go test -count=1 ./...
+
+  vulncheck:
+    name: Vulnerability scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+  build:
+    name: Build ${{ matrix.os }}-${{ matrix.arch }}
+    needs: test
+    runs-on: ubuntu-latest
     strategy:
       matrix:
         include:
-          # Windows
-          - os: windows
-            arch: amd64
-            runner: windows-latest
-            ext: .exe
-          # macOS Intel
-          - os: darwin
-            arch: amd64
-            runner: macos-latest
-            ext: ''
-          # macOS ARM (Apple Silicon)
-          - os: darwin
-            arch: arm64
-            runner: macos-latest
-            ext: ''
-          # Linux
-          - os: linux
-            arch: amd64
-            runner: ubuntu-latest
-            ext: ''
-          # Linux ARM64
-          - os: linux
-            arch: arm64
-            runner: ubuntu-latest
-            ext: ''
-
+          - { os: windows, arch: amd64, ext: .exe }
+          - { os: darwin,  arch: amd64, ext: '' }
+          - { os: darwin,  arch: arm64, ext: '' }
+          - { os: linux,   arch: amd64, ext: '' }
+          - { os: linux,   arch: arm64, ext: '' }
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
-    - name: Set up Go
-      uses: actions/setup-go@v4
-      with:
-        go-version: '1.24'
-        check-latest: true
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
 
-    - name: Cache Go modules
-      uses: actions/cache@v3
-      with:
-        path: |
-          ~/.cache/go-build
-          ~/go/pkg/mod
-        key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
-        restore-keys: |
-          ${{ runner.os }}-go-
+      # The SQLite driver is pure Go, so cross-compiling with CGO disabled is safe.
+      - name: Build executable
+        env:
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: 0
+          VERSION: ${{ github.ref_name }}
+        run: |
+          mkdir -p release
+          go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
+            -o "release/lazy-chat${{ matrix.ext }}" ./cmd
+          cp config.example.json release/
 
-    - name: Download dependencies
-      run: go mod download
-
-    - name: Run tests
-      run: go test -v ./...
-
-    - name: Build executable
-      env:
-        GOOS: ${{ matrix.os }}
-        GOARCH: ${{ matrix.arch }}
-        CGO_ENABLED: 0
-      run: |
-        go build -v -ldflags "-s -w -X main.version=${{ github.ref_name }}" -o lazy-chat-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext }} ./cmd
-
-    - name: Create release directory
-      run: |
-        mkdir -p release
-        cp lazy-chat-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext }} release/
-        cp config.example.json release/
-
-    - name: Upload artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: lazy-chat-${{ matrix.os }}-${{ matrix.arch }}
-        path: release/
-        retention-days: 30
+      - name: Upload artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: lazy-chat-${{ matrix.os }}-${{ matrix.arch }}
+          path: release/
+          retention-days: 30
 
   release:
     name: Create Release
-    needs: build
+    needs: [ build, vulncheck ]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
-    
+    permissions:
+      contents: write
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Download all artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts
 
-    - name: Download all artifacts
-      uses: actions/download-artifact@v4
-      with:
-        path: artifacts
+      - name: Create release archives
+        run: |
+          cd artifacts
+          for dir in */; do
+            name="${dir%/}"
+            (cd "$dir" && if [[ "$name" == *windows* ]]; then
+                zip -qr "../${name}.zip" .
+              else
+                tar -czf "../${name}.tar.gz" .
+              fi)
+          done
+          sha256sum *.zip *.tar.gz > SHA256SUMS
+          ls -la
 
-    - name: Create release archives
-      run: |
-        cd artifacts
-        for dir in */; do
-          if [ -d "$dir" ]; then
-            cd "$dir"
-            if [[ "$dir" == *"windows"* ]]; then
-              zip -r "../lazy-chat-${dir%/}.zip" .
-            else
-              tar -czf "../lazy-chat-${dir%/}.tar.gz" .
-            fi
-            cd ..
-          fi
-        done
-        ls -la *.zip *.tar.gz
-
-    - name: Create GitHub Release
-      uses: softprops/action-gh-release@v1
-      with:
-        files: |
-          artifacts/*.zip
-          artifacts/*.tar.gz
-        draft: false
-        prerelease: ${{ contains(github.ref, 'alpha') || contains(github.ref, 'beta') || contains(github.ref, 'rc') }}
-        generate_release_notes: true
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          files: |
+            artifacts/*.zip
+            artifacts/*.tar.gz
+            artifacts/SHA256SUMS
+          draft: false
+          prerelease: ${{ contains(github.ref, 'alpha') || contains(github.ref, 'beta') || contains(github.ref, 'rc') }}
+          generate_release_notes: true
