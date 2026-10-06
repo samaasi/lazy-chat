@@ -251,6 +251,11 @@ func TestGroupJourney(t *testing.T) {
 
 func TestRemovedMemberIsCutOff(t *testing.T) {
 	alice, bob := pair(t)
+	defer func() {
+		if t.Failed() {
+			t.Logf("bob's output:\n%s", bob.out.String())
+		}
+	}()
 	alice.say("/creategroup Crew")
 	alice.waitOut("Created group")
 	alice.say("/invite Crew bob")

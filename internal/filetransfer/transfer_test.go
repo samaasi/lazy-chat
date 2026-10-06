@@ -295,8 +295,14 @@ func TestTransferEndToEnd(t *testing.T) {
 	if offer.TransferID != id || offer.FileName != "payload.bin" || offer.FileSize != int64(len(data)) {
 		t.Fatalf("offer: %+v", offer)
 	}
-	if !strings.Contains(r.out.text(), "/getfile "+id[:8]) {
-		t.Fatalf("receiver was not told how to accept:\n%s", r.out.text())
+	// The offer is registered before the user is told about it (so that an
+	// immediate /getfile always finds it); the hint follows a moment later.
+	deadline := time.Now().Add(10 * time.Second)
+	for !strings.Contains(r.out.text(), "/getfile "+id[:8]) {
+		if time.Now().After(deadline) {
+			t.Fatalf("receiver was not told how to accept:\n%s", r.out.text())
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 	// Nothing touches the disk before the user agrees.
 	if entries, _ := os.ReadDir(r.dir); len(entries) != 0 {
