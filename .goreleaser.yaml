@@ -66,20 +66,27 @@ release:
     name: lazy-chat
   prerelease: auto
 
-# Homebrew: brew install samaasi/tap/lazy-chat
-brews:
+# Homebrew (macOS): brew install --cask samaasi/tap/lazy-chat
+# GoReleaser deprecated formulas for pre-built binaries in favour of casks. Casks
+# are a macOS feature first; on Linux use scripts/install.sh.
+homebrew_casks:
   - name: lazy-chat
     repository:
       owner: samaasi
       name: homebrew-tap
       token: "{{ .Env.TAP_GITHUB_TOKEN }}"
-    directory: Formula
+    directory: Casks
     homepage: https://github.com/samaasi/lazy-chat
     description: Serverless, end-to-end encrypted peer-to-peer chat for your local network
-    license: MIT
     skip_upload: auto
-    test: |
-      assert_match "lazy-chat", shell_output("#{bin}/lazy-chat --version")
+    # The binaries are not notarized by Apple; without this Gatekeeper refuses to
+    # start a program downloaded outside the App Store. (Same as GoReleaser's own example.)
+    hooks:
+      post:
+        install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/lazy-chat"]
+          end
 
 # Scoop: scoop bucket add samaasi https://github.com/samaasi/scoop-bucket && scoop install lazy-chat
 scoops:

@@ -14,7 +14,7 @@ a vulnerability scan, and [GoReleaser](https://goreleaser.com) ([.goreleaser.yam
 - builds `CGO_ENABLED=0` binaries for Linux, macOS and Windows on amd64 and arm64,
 - packs them as `lazy-chat_<version>_<os>_<arch>.tar.gz` (`.zip` on Windows),
 - writes `checksums.txt` (SHA-256) and signs it with cosign into `checksums.txt.sig`,
-- creates the GitHub release, and updates the Homebrew formula and the Scoop manifest.
+- creates the GitHub release, and updates the Homebrew cask (macOS) and the Scoop manifest. Homebrew casks are aimed at macOS; Linux users install with `scripts/install.sh`.
 
 Pull requests run the same build as a dry run (no signing, no publishing), so a broken
 configuration is caught before a release.

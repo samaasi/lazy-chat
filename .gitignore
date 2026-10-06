@@ -40,3 +40,6 @@ identity.key
 .idea/
 *.iml
 .vscode/
+
+# GoReleaser output
+/dist/

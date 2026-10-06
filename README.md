@@ -32,7 +32,7 @@ One command, no dependencies. Each installer downloads the release for your mach
 | System | Command |
 | --- | --- |
 | **macOS, Linux** | `curl -fsSL https://raw.githubusercontent.com/samaasi/lazy-chat/master/scripts/install.sh \| sh` |
-| **macOS, Linux** (Homebrew) | `brew install samaasi/tap/lazy-chat` |
+| **macOS** (Homebrew) | `brew install --cask samaasi/tap/lazy-chat` |
 | **Windows** (PowerShell) | `irm https://raw.githubusercontent.com/samaasi/lazy-chat/master/scripts/install.ps1 \| iex` |
 | **Windows** (Scoop) | `scoop bucket add samaasi https://github.com/samaasi/scoop-bucket` then `scoop install lazy-chat` |
 | **Go 1.27+** | `go install github.com/samaasi/lazy-chat/cmd/lazy-chat@latest` |
