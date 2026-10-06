@@ -2,10 +2,10 @@ package interfaces
 
 import (
 	"context"
-	"net"
 	"time"
 
 	"github.com/samaasi/lazy-chat/internal/models"
+	"github.com/samaasi/lazy-chat/internal/protocol"
 )
 
 // PeerDiscovery handles peer discovery functionality
@@ -14,46 +14,58 @@ type PeerDiscovery interface {
 	Start(ctx context.Context) error
 	// Stop gracefully stops the discovery process
 	Stop() error
-	// GetPeers returns all discovered peers
-	GetPeers() map[string]*models.Peer
-	// GetPeer returns a specific peer by ID
-	GetPeer(id string) (*models.Peer, bool)
 }
 
-// NetworkManager handles TCP connections and messaging
+// FrameHandler receives the body of a frame from an authenticated peer.
+// peerID is the identity proven by the TLS handshake and is the only thing a
+// handler may trust about who sent the frame. Handlers run on the
+// connection's read goroutine and must not block for long.
+type FrameHandler func(peerID string, body []byte)
+
+// PeerListener is told when authenticated peer connections come and go.
+type PeerListener interface {
+	PeerConnected(peerID, username string)
+	PeerDisconnected(peerID string)
+}
+
+// NetworkManager handles authenticated, encrypted peer connections.
 type NetworkManager interface {
 	// Start begins listening for incoming connections
 	Start(ctx context.Context) error
 	// Stop gracefully stops the network manager
 	Stop() error
-	// ConnectToPeer establishes a connection to a peer
+	// ConnectToPeer establishes a connection to a discovered peer
 	ConnectToPeer(ctx context.Context, peerID string) error
-	// SendMessage sends a message to a connected peer
-	SendMessage(peerID, message string) error
-	// SendGroupMessage sends a group message to multiple connected peers
-	SendGroupMessage(peerIDs []string, groupMessage *models.ChatMessage) error
-	// GetConnections returns all active connections
-	GetConnections() map[string]net.Conn
+	// Disconnect closes the connection to a peer, if any
+	Disconnect(peerID string)
+	// Send queues a frame for a peer, connecting first if needed
+	Send(ctx context.Context, peerID string, kind protocol.Kind, body []byte) error
+	// SendJSON marshals payload and sends it as a frame
+	SendJSON(ctx context.Context, peerID string, kind protocol.Kind, payload any) error
 	// IsConnected checks if connected to a specific peer
 	IsConnected(peerID string) bool
+	// ConnectedPeers returns the IDs of all connected peers
+	ConnectedPeers() []string
+	// PeerName returns the display name a peer announced, if known
+	PeerName(peerID string) (string, bool)
+	// Handle registers the handler for a frame kind
+	Handle(kind protocol.Kind, h FrameHandler)
+	// AddListener subscribes to connect/disconnect events
+	AddListener(l PeerListener)
 }
 
-// MessageHandler handles incoming chat messages
-type MessageHandler interface {
-	HandleMessage(msg *models.ChatMessage)
-	SetMessageCallback(callback func(*models.ChatMessage))
-}
-
-// PeerManager manages peer lifecycle and state
+// PeerManager manages the set of known peers
 type PeerManager interface {
-	// AddPeer adds or updates a peer
-	AddPeer(peer *models.Peer)
+	// AddPeer adds or updates a peer; it reports whether the peer is new.
+	AddPeer(peer *models.Peer) (added bool)
 	// RemovePeer removes a peer
 	RemovePeer(peerID string)
 	// GetPeer retrieves a peer by ID
 	GetPeer(peerID string) (*models.Peer, bool)
-	// GetAllPeers returns all peers
-	GetAllPeers() map[string]*models.Peer
+	// Peers returns a snapshot of all peers, sorted by name
+	Peers() []*models.Peer
+	// ResolvePeer finds a peer by full ID, unique ID prefix, or username
+	ResolvePeer(query string) (*models.Peer, error)
 	// CleanupStalePeers removes peers that haven't been seen recently
 	CleanupStalePeers(threshold time.Duration)
 }
@@ -85,6 +97,6 @@ type Logger interface {
 
 // IDGenerator generates unique identifiers
 type IDGenerator interface {
-	// GenerateID creates a poetic identifier
+	// GenerateID creates a unique identifier
 	GenerateID() string
 }
