@@ -54,6 +54,14 @@ type MessageStorage interface {
 	GetUndeliveredDirect(ctx context.Context, fromPeerID, toPeerID string, since time.Time, limit int) ([]*models.ChatMessage, error)
 	// PeersWithUndelivered lists recipients that have unacknowledged messages.
 	PeersWithUndelivered(ctx context.Context, fromPeerID string, since time.Time) ([]string, error)
+	// GetMessage returns one message by sender and ID (ErrNotFound if absent).
+	GetMessage(ctx context.Context, fromPeerID, messageID string) (*models.ChatMessage, error)
+	// MarkMessageRelayed records that an encrypted copy went to relays.
+	MarkMessageRelayed(ctx context.Context, fromPeerID, messageID string) error
+	// GetUnrelayedDirect returns undelivered direct messages not yet handed to a relay.
+	GetUnrelayedDirect(ctx context.Context, fromPeerID, toPeerID string, since time.Time, limit int) ([]*models.ChatMessage, error)
+	// PeersWithUnrelayed lists recipients with undelivered, unrelayed messages.
+	PeersWithUnrelayed(ctx context.Context, fromPeerID string, since time.Time) ([]string, error)
 }
 
 // VerificationStorage records which peers the user has verified out of band.
@@ -116,6 +124,8 @@ type Database interface {
 	GroupStorage
 	InviteStorage
 	VerificationStorage
+	PrekeyStorage
+	RelayStorage
 	// Connect establishes database connection
 	Connect(ctx context.Context) error
 	// Close closes database connection

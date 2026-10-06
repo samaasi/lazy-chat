@@ -197,6 +197,47 @@ var migrations = [][]string{
 			value TEXT NOT NULL
 		)`,
 	},
+	{ // 4: offline delivery - prekeys, cached bundles and the relay's queue
+		`ALTER TABLE messages ADD COLUMN relayed_at INTEGER`,
+		`CREATE INDEX idx_msg_unrelayed ON messages (to_peer_id, seq)
+			WHERE delivered = 0 AND relayed_at IS NULL AND deleted_at IS NULL AND message_type = 'direct'`,
+		`CREATE TABLE prekeys (
+			id           INTEGER PRIMARY KEY AUTOINCREMENT,
+			kind         TEXT NOT NULL CHECK (kind IN ('spk', 'opk')),
+			pub          BLOB NOT NULL,
+			priv         TEXT NOT NULL,
+			sig          BLOB,
+			reserved_for TEXT,
+			created      INTEGER NOT NULL
+		)`,
+		`CREATE INDEX idx_prekeys_reserved ON prekeys (kind, reserved_for)`,
+		`CREATE TABLE peer_bundles (
+			peer_id TEXT PRIMARY KEY,
+			bundle  TEXT NOT NULL,
+			updated INTEGER NOT NULL
+		)`,
+		`CREATE TABLE relay_envelopes (
+			id        TEXT PRIMARY KEY,
+			from_peer TEXT NOT NULL,
+			to_peer   TEXT NOT NULL,
+			blob      BLOB NOT NULL,
+			created   INTEGER NOT NULL,
+			expires   INTEGER NOT NULL
+		)`,
+		`CREATE INDEX idx_relay_to ON relay_envelopes (to_peer, created)`,
+		`CREATE INDEX idx_relay_from ON relay_envelopes (from_peer)`,
+		`CREATE INDEX idx_relay_expires ON relay_envelopes (expires)`,
+		`CREATE TABLE relay_receipts (
+			to_peer TEXT NOT NULL,
+			msg_id  TEXT NOT NULL,
+			signer  TEXT NOT NULL,
+			ed_pub  BLOB NOT NULL,
+			sig     BLOB NOT NULL,
+			expires INTEGER NOT NULL,
+			PRIMARY KEY (to_peer, msg_id, signer)
+		)`,
+		`CREATE INDEX idx_receipts_expires ON relay_receipts (expires)`,
+	},
 }
 
 // legacyTables are the tables of the two incompatible schemas older versions

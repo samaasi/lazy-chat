@@ -161,6 +161,23 @@ func (s *SQLiteDB) encryptExisting(ctx context.Context) error {
 		return fmt.Errorf("failed to encrypt invitations: %w", err)
 	}
 
+	if err := collect(`SELECT id, pub, priv FROM prekeys`, func(r *sql.Rows) (fieldUpdate, error) {
+		var id int64
+		var pub []byte
+		var priv string
+		err := r.Scan(&id, &pub, &priv)
+		return fieldUpdate{`UPDATE prekeys SET priv = ? WHERE id = ?`, []any{s.seal(aadPrekey(pub), priv), id}}, err
+	}); err != nil {
+		return fmt.Errorf("failed to encrypt prekeys: %w", err)
+	}
+	if err := collect(`SELECT peer_id, bundle FROM peer_bundles`, func(r *sql.Rows) (fieldUpdate, error) {
+		var peer, bundle string
+		err := r.Scan(&peer, &bundle)
+		return fieldUpdate{`UPDATE peer_bundles SET bundle = ? WHERE peer_id = ?`, []any{s.seal(aadBundle(peer), bundle), peer}}, err
+	}); err != nil {
+		return fmt.Errorf("failed to encrypt bundles: %w", err)
+	}
+
 	// Old versions' retired tables are plaintext; drop the ones with no data.
 	for _, table := range legacyTables {
 		name := "legacy_" + table
