@@ -98,7 +98,8 @@ func TestConfiguredPeersAreRetriedUntilTheyAppear(t *testing.T) {
 	alice := newInstance(t, "alice", randomBase(), func(c *config.Config) {
 		c.Peers = []string{fmt.Sprintf("127.0.0.1:%d", port)}
 	})
-	time.Sleep(500 * time.Millisecond) // the first attempt finds nobody
+	// The user is told right away what is happening and why it failed.
+	alice.waitOut("Connecting to 127.0.0.1:", "Could not reach", "firewall allow TCP port")
 	bob := newInstance(t, "bob", randomBase(), func(c *config.Config) { c.TCPPort = port })
 	alice.waitOut("bob", "connected")
 	_ = bob

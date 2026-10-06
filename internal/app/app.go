@@ -295,7 +295,8 @@ var connectBackoff = []time.Duration{0, 2 * time.Second, 5 * time.Second, 10 * t
 func (a *App) connectConfigured(t address.Target) {
 	defer a.wg.Done()
 	var last error
-	for _, wait := range connectBackoff {
+	a.console.Printf("* Connecting to %s ...", t)
+	for attempt, wait := range connectBackoff {
 		select {
 		case <-a.ctx.Done():
 			return
@@ -312,6 +313,11 @@ func (a *App) connectConfigured(t address.Target) {
 		}
 		last = err
 		a.logger.Debug("Could not reach configured peer", "address", t.String(), "error", err)
+		if attempt == 0 {
+			// Say why straight away, instead of leaving the user to wonder.
+			a.console.Printf("* Could not reach %s yet: %v", t, err)
+			a.console.Printf("  Is lazy-chat running there, and does its firewall allow TCP port %d? Retrying for a few minutes.", t.Port)
+		}
 	}
 	a.console.Printf("* Could not connect to %s: %v", t, last)
 }
