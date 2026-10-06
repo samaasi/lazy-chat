@@ -36,7 +36,10 @@ func (h *Handler) RetryUndelivered(ctx context.Context, peerID string) (int, err
 	sent := 0
 	for _, msg := range msgs {
 		if err := h.Net.SendJSON(ctx, peerID, protocol.KindMessage, msg); err != nil {
-			return sent, err // the peer is unreachable; the rest wait for next time
+			// Unreachable: queue the rest with relays so they reach the peer
+			// even if we are offline when it comes back.
+			h.relayPending(ctx, peerID)
+			return sent, err
 		}
 		sent++
 	}
@@ -63,5 +66,16 @@ func (h *Handler) RetryAll(ctx context.Context) {
 		if _, err := h.RetryUndelivered(ctx, peerID); err != nil {
 			h.Logger.Debug("Retry failed", "peer", shortID(peerID), "error", err)
 		}
+	}
+
+	// Peers we cannot see at all are exactly who relays are for.
+	for _, peerID := range h.pendingWithoutDirectPath(ctx) {
+		if ctx.Err() != nil {
+			return
+		}
+		if _, known := h.Peers.GetPeer(peerID); known || h.Net.IsConnected(peerID) {
+			continue // handled above
+		}
+		h.relayPending(ctx, peerID)
 	}
 }

@@ -53,6 +53,8 @@ type Deps struct {
 	Peers    interfaces.PeerManager
 	Notifier interfaces.NotificationManager
 	Out      Printer
+	// Relay, when set, delivers to offline recipients through other peers.
+	Relay Relayer
 }
 
 // Handler processes chat traffic. It is safe for concurrent use.
@@ -257,7 +259,13 @@ func (h *Handler) checkInbound(ctx context.Context, from string, msg *models.Cha
 }
 
 func (h *Handler) display(msg *models.ChatMessage, group *models.Group) {
-	ts := msg.Timestamp.Format("15:04:05")
+	h.displayAt(msg, group, "15:04:05")
+}
+
+// displayAt prints a received message, stamped with the given time layout
+// (messages that arrive late show their date).
+func (h *Handler) displayAt(msg *models.ChatMessage, group *models.Group, layout string) {
+	ts := msg.Timestamp.Format(layout)
 	text := utils.SanitizeText(msg.Message, 0)
 
 	who := h.DisplayName(msg.From)
@@ -308,15 +316,22 @@ func (h *Handler) SendMessage(ctx context.Context, peerID, content string) error
 		return fmt.Errorf("could not save message: %w", err)
 	}
 	if err := h.Net.SendJSON(ctx, peerID, protocol.KindMessage, msg); err != nil {
-		return fmt.Errorf("message saved but not delivered: %w", err)
+		// Unreachable: ask other peers to hold an encrypted copy for them.
+		n, rerr := h.relayCopy(ctx, peerID, msg)
+		if rerr != nil {
+			return fmt.Errorf("message saved but not delivered: %w", err)
+		}
+		_ = h.Store.MarkMessageRelayed(ctx, h.SelfID, msg.ID)
+		return &QueuedError{Relays: n}
 	}
 	return nil
 }
 
 // GroupSendResult reports per-member outcomes of a group message.
 type GroupSendResult struct {
-	Queued []string
-	Failed map[string]error
+	Queued  []string         // delivered to a live connection
+	Relayed []string         // offline; an encrypted copy is queued with relays
+	Failed  map[string]error // could not be reached or queued
 }
 
 // SendGroupMessage stores a message and sends it to every other member.
@@ -350,7 +365,17 @@ func (h *Handler) SendGroupMessage(ctx context.Context, groupID, content string)
 		}
 	})
 
-	if len(targets) > 0 && len(res.Queued) == 0 {
+	// Members we could not reach get an encrypted copy through relays.
+	for peerID, sendErr := range res.Failed {
+		if _, err := h.relayCopy(ctx, peerID, msg); err == nil {
+			res.Relayed = append(res.Relayed, peerID)
+			delete(res.Failed, peerID)
+		} else {
+			res.Failed[peerID] = fmt.Errorf("%w (and could not be queued: %v)", sendErr, err)
+		}
+	}
+
+	if len(targets) > 0 && len(res.Queued)+len(res.Relayed) == 0 {
 		return res, fmt.Errorf("message saved but not delivered to anyone: %w", firstError(res.Failed))
 	}
 	return res, nil
