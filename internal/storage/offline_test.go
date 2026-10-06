@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -464,5 +465,34 @@ func TestRelayedFlagOnOwnMessages(t *testing.T) {
 	_ = db.MarkMessageRelayed(ctx, "me", "m2")
 	if peers, _ := db.PeersWithUnrelayed(ctx, "me", since); len(peers) != 1 || peers[0] != "carol" {
 		t.Fatalf("peers after relaying: %v", peers)
+	}
+}
+
+// Transactions here read first (a quota check) and then write. If they start
+// as plain read transactions, SQLite fails the ones that lose a race with
+// "database is locked (517)" instead of waiting, and busy_timeout cannot help.
+// They must take the write lock up front.
+func TestConcurrentReadThenWriteTransactionsDoNotFailWithBusy(t *testing.T) {
+	db := openDB(t)
+	exp := time.Now().Add(time.Hour)
+	const workers, each = 16, 25
+	errs := make(chan error, workers*each)
+	var wg sync.WaitGroup
+	for w := range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range each {
+				r := RelayReceipt{Tag: fmt.Sprintf("t-%d-%d", w, i), MsgID: "m", Signer: "bob", EdPub: key(1), Sig: key(2), Expires: exp}
+				errs <- db.PutReceipt(ctx, r, RelayLimits{MaxReceipts: 100000}) // counts the signer's receipts, then inserts
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent transaction failed: %v", err)
+		}
 	}
 }

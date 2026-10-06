@@ -57,13 +57,20 @@ func NewSQLiteDB(path string, opts ...Option) *SQLiteDB {
 
 // dsn builds a file: URI that applies the pragmas to every pooled connection
 // (a plain `PRAGMA` statement would only affect one of them).
+//
+// _txlock=immediate makes every transaction take the write lock when it
+// starts. All of ours write, and most read first (a quota check, a lookup).
+// Started as plain read transactions they would fail with SQLITE_BUSY_SNAPSHOT
+// ("database is locked (517)") whenever another connection wrote in between,
+// which busy_timeout cannot wait out; started this way they simply queue.
 func dsn(path string) string {
 	escaped := strings.NewReplacer("%", "%25", "?", "%3f", "#", "%23").Replace(filepath.ToSlash(path))
 	return "file:" + escaped +
 		"?_pragma=busy_timeout(5000)" +
 		"&_pragma=journal_mode(WAL)" +
 		"&_pragma=synchronous(NORMAL)" +
-		"&_pragma=foreign_keys(1)"
+		"&_pragma=foreign_keys(1)" +
+		"&_txlock=immediate"
 }
 
 // Connect opens the database, creating it (0600, in a 0700 directory) if needed.
