@@ -43,6 +43,7 @@ type Config struct {
 	Relay                bool            `json:"relay"`             // hold encrypted messages for offline peers
 	RelayMaxStorage      int64           `json:"relay_max_storage"` // bytes of other peers' messages held at most
 	SealedSender         string          `json:"sealed_sender"`     // auto or required: hide who queues a message from relays
+	UpdateCheck          bool            `json:"update_check"`      // tell me at start-up when a new release exists (never installs it)
 	DownloadDir          string          `json:"download_dir"`
 	MaxFileSize          int64           `json:"max_file_size"`     // bytes accepted per incoming file
 	AutoAcceptFiles      bool            `json:"auto_accept_files"` // otherwise /getfile is required
@@ -112,6 +113,7 @@ func DefaultConfig() *Config {
 		Relay:             true,
 		RelayMaxStorage:   64 << 20,
 		SealedSender:      "auto",
+		UpdateCheck:       true,
 		DownloadDir:       "downloads",
 		MaxFileSize:       256 << 20,
 		Database:          &DatabaseConfig{},
@@ -195,6 +197,7 @@ func (c *Config) loadFromEnv(getenv func(string) string) error {
 		{"P2P_RELAY", &c.Relay},
 		{"P2P_RELAY_MAX_STORAGE", &c.RelayMaxStorage},
 		{"P2P_SEALED_SENDER", &c.SealedSender},
+		{"P2P_UPDATE_CHECK", &c.UpdateCheck},
 		{"P2P_DOWNLOAD_DIR", &c.DownloadDir},
 		{"P2P_MAX_FILE_SIZE", &c.MaxFileSize},
 		{"P2P_AUTO_ACCEPT_FILES", &c.AutoAcceptFiles},
@@ -259,6 +262,7 @@ func (c *Config) loadFromFlags(args []string) error {
 	str(&c.PassphraseFile, "passphrase-file", "File containing the passphrase")
 	fs.BoolVar(&c.Relay, "relay", c.Relay, "Hold encrypted messages for offline peers (--relay=false to disable)")
 	fs.Int64Var(&c.RelayMaxStorage, "relay-max-storage", c.RelayMaxStorage, "Most bytes of other peers' messages to hold")
+	fs.BoolVar(&c.UpdateCheck, "update-check", c.UpdateCheck, "Check GitHub once a day for a new release and say so (--update-check=false to disable)")
 	fs.StringVar(&c.SealedSender, "sealed-sender", c.SealedSender, "Offline delivery privacy: auto or required")
 	str(&c.DownloadDir, "download-dir", "Directory for downloaded files")
 	fs.Int64Var(&c.MaxFileSize, "max-file-size", c.MaxFileSize, "Largest incoming file in bytes")
@@ -296,6 +300,7 @@ Options:
       --passphrase-file <file>  Read the passphrase from this file instead of asking
       --relay=false             Do not hold encrypted messages for offline peers (default on)
       --relay-max-storage <n>   Most bytes of other peers' messages to hold (default 67108864)
+      --update-check=false      Do not look for new releases at start-up (default on, once a day)
       --sealed-sender <mode>    auto: queue offline messages even when a relay can see you are the sender
                                 (you are told); required: only queue them anonymously (default auto)
       --download-dir <dir>      Where received files are saved (default downloads)

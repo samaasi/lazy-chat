@@ -44,10 +44,12 @@ const (
 type Option func(*options)
 
 type options struct {
-	in         io.Reader
-	out        io.Writer
-	version    string
-	passphrase string
+	in      io.Reader
+	out     io.Writer
+	version string
+
+	updateNotice func(ctx context.Context) string
+	passphrase   string
 }
 
 // WithIO sets the CLI's input and output.
@@ -62,11 +64,22 @@ func WithPassphrase(p string) Option { return func(o *options) { o.passphrase = 
 // WithVersion sets the version shown in the banner.
 func WithVersion(v string) Option { return func(o *options) { o.version = v } }
 
+// WithUpdateNotice supplies a function that reports a newer version, or "" if
+// there is none. It runs once in the background after start-up; the app only
+// tells the user, it never updates itself.
+func WithUpdateNotice(fn func(ctx context.Context) string) Option {
+	return func(o *options) { o.updateNotice = fn }
+}
+
 // App represents the main application
 type App struct {
 	config *config.Config
 	logger *logger.Logger
-	id     *identity.Identity
+
+	version      string
+	updateNotice func(ctx context.Context) string
+
+	id *identity.Identity
 
 	peers     *peer.Manager
 	netMgr    *network.Manager
@@ -206,7 +219,7 @@ func New(cfg *config.Config, opts ...Option) (_ *App, err error) {
 		config: cfg, logger: log, id: id, peers: peers, netMgr: netMgr, handler: handler, files: files, relay: relayMgr,
 		notifier: notifier, db: db, groups: groups, history: history, console: console,
 		discovery: discovery.NewService(discovery.OptionsFromConfig(cfg), id, log, peers),
-		ctx:       ctx, cancel: cancel,
+		ctx:       ctx, cancel: cancel, version: o.version, updateNotice: o.updateNotice,
 	}
 	a.cli = cli.New(cli.Deps{
 		In: o.in, Console: console, SelfID: id.ID(), SelfName: cfg.Username,
@@ -260,7 +273,21 @@ func (a *App) Start() error {
 
 	a.wg.Add(1)
 	go a.cleanupRoutine()
+	if a.updateNotice != nil {
+		a.wg.Add(1)
+		go a.announceUpdate()
+	}
 	return nil
+}
+
+// announceUpdate tells the user once if a newer release exists.
+func (a *App) announceUpdate() {
+	defer a.wg.Done()
+	ctx, cancel := context.WithTimeout(a.ctx, 10*time.Second)
+	defer cancel()
+	if v := a.updateNotice(ctx); v != "" {
+		a.console.Printf("* A new version is available: %s (you have %s). Run \"lazy-chat update\" to install it.", v, a.version)
+	}
 }
 
 // Stop shuts everything down in dependency order and releases all resources.
