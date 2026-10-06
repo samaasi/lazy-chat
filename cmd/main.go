@@ -36,7 +36,7 @@ func run(args []string) int {
 		return 2
 	}
 
-	application, err := app.New(cfg)
+	application, err := app.New(cfg, app.WithVersion(version))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Failed to create application:", describe(err))
 		return 1

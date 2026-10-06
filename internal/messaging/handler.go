@@ -380,9 +380,18 @@ func (h *Handler) fanOut(ctx context.Context, targets []string, send func(contex
 
 // ---- Peer events -----------------------------------------------------------
 
+func (h *Handler) isClosed() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.closed
+}
+
 // PeerConnected implements interfaces.PeerListener.
 func (h *Handler) PeerConnected(peerID, username string) {
 	h.names.Store(peerID, utils.SanitizeText(username, 32))
+	if h.isClosed() {
+		return
+	}
 	name := h.DisplayName(peerID)
 	h.Out.Printf("* %s connected", name)
 	if h.Notifier != nil {
@@ -392,6 +401,9 @@ func (h *Handler) PeerConnected(peerID, username string) {
 
 // PeerDisconnected implements interfaces.PeerListener.
 func (h *Handler) PeerDisconnected(peerID string) {
+	if h.isClosed() {
+		return // connections closing during shutdown are not news
+	}
 	name := h.DisplayName(peerID)
 	h.Out.Printf("* %s disconnected", name)
 	if h.Notifier != nil {
