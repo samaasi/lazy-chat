@@ -130,7 +130,31 @@ func (i *instance) neverOut(fragment string, wait time.Duration) {
 	}
 }
 
-func randomBase() int { return 20000 + rand.IntN(30000) }
+// randomBase picks a base UDP port such that base..base+7 can all be bound
+// right now. Random ports can fall into OS-reserved ranges (Windows excludes
+// some for Hyper-V/WSL), which would make tests flaky.
+func randomBase() int {
+	for range 200 {
+		base := 20000 + rand.IntN(30000)
+		var conns []*net.UDPConn
+		ok := true
+		for p := base; p < base+8; p++ {
+			c, err := net.ListenUDP("udp4", &net.UDPAddr{Port: p})
+			if err != nil {
+				ok = false
+				break
+			}
+			conns = append(conns, c)
+		}
+		for _, c := range conns {
+			c.Close()
+		}
+		if ok {
+			return base
+		}
+	}
+	panic("no usable UDP port range found")
+}
 
 func pair(t *testing.T, mods ...func(*config.Config)) (alice, bob *instance) {
 	t.Helper()

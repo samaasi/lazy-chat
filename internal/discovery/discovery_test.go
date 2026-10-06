@@ -24,8 +24,31 @@ type svc struct {
 	peers *peer.Manager
 }
 
-// randomBase picks a base port unlikely to collide between parallel runs.
-func randomBase() int { return 20000 + rand.IntN(30000) }
+// randomBase picks a base UDP port such that base..base+7 can all be bound
+// right now. Random ports can fall into OS-reserved ranges (Windows excludes
+// some for Hyper-V/WSL), which would make tests flaky.
+func randomBase() int {
+	for range 200 {
+		base := 20000 + rand.IntN(30000)
+		var conns []*net.UDPConn
+		ok := true
+		for p := base; p < base+8; p++ {
+			c, err := net.ListenUDP("udp4", &net.UDPAddr{Port: p})
+			if err != nil {
+				ok = false
+				break
+			}
+			conns = append(conns, c)
+		}
+		for _, c := range conns {
+			c.Close()
+		}
+		if ok {
+			return base
+		}
+	}
+	panic("no usable UDP port range found")
+}
 
 func newSvc(t *testing.T, name string, base int, mod ...func(*Options)) *svc {
 	t.Helper()
@@ -219,7 +242,9 @@ func TestReplayedAnnouncementDoesNotMoveAPeer(t *testing.T) {
 	if p.Address != "10.0.0.2" {
 		t.Fatalf("replay moved the peer to %s", p.Address)
 	}
-	// The identical packet twice is also dropped.
+	// The identical packet twice is also dropped. (Timestamps have
+	// millisecond resolution, so let the clock move first.)
+	time.Sleep(5 * time.Millisecond)
 	same := sign(id, nil)
 	inject(s, same, "10.0.0.3")
 	inject(s, same, "10.0.0.4")
