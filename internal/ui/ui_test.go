@@ -77,6 +77,7 @@ func TestStatusLineIsReplacedByNextOutput(t *testing.T) {
 	}
 }
 
+
 type fakeDisplay struct {
 	mu    sync.Mutex
 	lines []string
@@ -156,5 +157,18 @@ func TestFormatBytes(t *testing.T) {
 	}
 	if got := FormatBytes(1<<62 + 5); got == "" {
 		t.Error("huge value produced nothing")
+	}
+}
+
+func TestEndStatusRestoresPrompt(t *testing.T) {
+	var buf bytes.Buffer
+	c := NewConsole(&buf)
+	c.SetPrompt("> ")
+	c.ShowPrompt()
+	buf.Reset()
+	c.Status("50%")
+	c.EndStatus()
+	if want := "\r50%\n> "; buf.String() != want {
+		t.Fatalf("got %q, want %q", buf.String(), want)
 	}
 }

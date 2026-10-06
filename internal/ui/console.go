@@ -101,7 +101,11 @@ func (c *Console) EndStatus() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.status {
-		_, _ = io.WriteString(c.out, "\n")
+		out := "\n"
+		if c.prompting {
+			out += c.prompt // the status line overwrote the user's prompt
+		}
+		_, _ = io.WriteString(c.out, out)
 		c.status = false
 	}
 }
