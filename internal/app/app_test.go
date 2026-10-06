@@ -60,6 +60,7 @@ func newInstance(t *testing.T, name string, discBase int, mod ...func(*config.Co
 	t.Helper()
 	dir := t.TempDir()
 	cfg := config.DefaultConfig()
+	cfg.Encryption = "off" // tests must never prompt for a passphrase or touch DPAPI
 	cfg.Username = name
 	cfg.TCPPort = freeTCPPort(t)
 	cfg.ListenAddr = "127.0.0.1"
@@ -362,6 +363,7 @@ func TestExportNeverOverwrites(t *testing.T) {
 
 func TestQuitCommandEndsRun(t *testing.T) {
 	cfg := config.DefaultConfig()
+	cfg.Encryption = "off" // tests must never prompt for a passphrase or touch DPAPI
 	dir := t.TempDir()
 	cfg.TCPPort = freeTCPPort(t)
 	cfg.ListenAddr = "127.0.0.1"
@@ -418,6 +420,7 @@ func TestStopIsIdempotentAndReleasesPorts(t *testing.T) {
 
 func TestIdentityIsStableAcrossRestarts(t *testing.T) {
 	cfg := config.DefaultConfig()
+	cfg.Encryption = "off" // tests must never prompt for a passphrase or touch DPAPI
 	dir := t.TempDir()
 	cfg.TCPPort = freeTCPPort(t)
 	cfg.ListenAddr = "127.0.0.1"
@@ -443,6 +446,7 @@ func TestIdentityIsStableAcrossRestarts(t *testing.T) {
 
 func TestNewFailsCleanlyOnBadConfig(t *testing.T) {
 	cfg := config.DefaultConfig()
+	cfg.Encryption = "off" // tests must never prompt for a passphrase or touch DPAPI
 	cfg.Username = ""
 	if _, err := New(cfg); err == nil {
 		t.Fatal("invalid config accepted")

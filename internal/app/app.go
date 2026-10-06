@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -27,6 +28,8 @@ import (
 	"github.com/samaasi/lazy-chat/internal/services"
 	"github.com/samaasi/lazy-chat/internal/storage"
 	"github.com/samaasi/lazy-chat/internal/ui"
+	"github.com/samaasi/lazy-chat/internal/vault"
+	"golang.org/x/term"
 )
 
 const (
@@ -39,15 +42,20 @@ const (
 type Option func(*options)
 
 type options struct {
-	in      io.Reader
-	out     io.Writer
-	version string
+	in         io.Reader
+	out        io.Writer
+	version    string
+	passphrase string
 }
 
 // WithIO sets the CLI's input and output.
 func WithIO(in io.Reader, out io.Writer) Option {
 	return func(o *options) { o.in, o.out = in, out }
 }
+
+// WithPassphrase supplies the encryption passphrase directly (for tests and
+// embedding); normally it is typed, or read from a file or the environment.
+func WithPassphrase(p string) Option { return func(o *options) { o.passphrase = p } }
 
 // WithVersion sets the version shown in the banner.
 func WithVersion(v string) Option { return func(o *options) { o.version = v } }
@@ -110,7 +118,29 @@ func New(cfg *config.Config, opts ...Option) (_ *App, err error) {
 	}
 	undo = append(undo, func() { _ = log.Close() })
 
-	id, err := identity.LoadOrCreate(cfg.DataDir)
+	// Encryption at rest: unlock (or create) the data key first, because the
+	// identity key and the database are both protected by it.
+	vopts := vault.Options{
+		Mode:           vault.Mode(strings.ToLower(cfg.Encryption)),
+		Passphrase:     o.passphrase,
+		PassphraseFile: cfg.PassphraseFile,
+	}
+	if f, ok := o.in.(*os.File); ok && term.IsTerminal(int(f.Fd())) {
+		vopts.Prompt = terminalPassphrasePrompt(f, os.Stderr)
+	}
+	dataVault, err := vault.Open(cfg.DataDir, vopts)
+	if err != nil {
+		return nil, apperrors.Wrap(err, apperrors.ErrorTypeApplication, "ENC001", "failed to unlock encrypted storage").WithContext("data_dir", cfg.DataDir)
+	}
+	// A nil *Vault inside an interface would not compare equal to nil.
+	var sealer identity.Sealer
+	var dbOpts []storage.Option
+	if dataVault != nil {
+		sealer = dataVault
+		dbOpts = append(dbOpts, storage.WithVault(dataVault))
+	}
+
+	id, err := identity.LoadOrCreateSealed(cfg.DataDir, sealer)
 	if err != nil {
 		return nil, apperrors.Wrap(err, apperrors.ErrorTypeApplication, "ID001", "failed to load peer identity").WithContext("data_dir", cfg.DataDir)
 	}
@@ -119,7 +149,7 @@ func New(cfg *config.Config, opts ...Option) (_ *App, err error) {
 		return nil, apperrors.Wrap(err, apperrors.ErrorTypeApplication, "APP007", "failed to create download directory").WithContext("dir", cfg.DownloadDir)
 	}
 
-	db := storage.NewSQLiteDB(cfg.Database.Path)
+	db := storage.NewSQLiteDB(cfg.Database.Path, dbOpts...)
 	if err := db.Connect(context.Background()); err != nil {
 		return nil, apperrors.Wrap(err, apperrors.ErrorTypeDatabase, "DB001", "failed to open database").WithContext("path", cfg.Database.Path)
 	}

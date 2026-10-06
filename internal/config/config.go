@@ -37,7 +37,9 @@ type Config struct {
 	LogFormat            string          `json:"log_format"` // text or json
 	LogFile              string          `json:"log_file"`   // empty for stderr
 	NotificationsEnabled bool            `json:"notifications_enabled"`
-	DataDir              string          `json:"data_dir"` // identity key and database live here
+	DataDir              string          `json:"data_dir"`        // identity key and database live here
+	Encryption           string          `json:"encryption"`      // auto, passphrase, os or off: encryption at rest
+	PassphraseFile       string          `json:"passphrase_file"` // file holding the passphrase, for unattended start-up
 	DownloadDir          string          `json:"download_dir"`
 	MaxFileSize          int64           `json:"max_file_size"`     // bytes accepted per incoming file
 	AutoAcceptFiles      bool            `json:"auto_accept_files"` // otherwise /getfile is required
@@ -103,6 +105,7 @@ func DefaultConfig() *Config {
 		LogLevel:          "info",
 		LogFormat:         "text",
 		DataDir:           defaultDataDir(),
+		Encryption:        "auto",
 		DownloadDir:       "downloads",
 		MaxFileSize:       256 << 20,
 		Database:          &DatabaseConfig{},
@@ -181,6 +184,8 @@ func (c *Config) loadFromEnv(getenv func(string) string) error {
 		{"P2P_LOG_FILE", &c.LogFile},
 		{"P2P_NOTIFICATIONS", &c.NotificationsEnabled},
 		{"P2P_DATA_DIR", &c.DataDir},
+		{"P2P_ENCRYPTION", &c.Encryption},
+		{"P2P_PASSPHRASE_FILE", &c.PassphraseFile},
 		{"P2P_DOWNLOAD_DIR", &c.DownloadDir},
 		{"P2P_MAX_FILE_SIZE", &c.MaxFileSize},
 		{"P2P_AUTO_ACCEPT_FILES", &c.AutoAcceptFiles},
@@ -241,6 +246,8 @@ func (c *Config) loadFromFlags(args []string) error {
 	str(&c.LogFile, "log-file", "Log file path")
 	fs.BoolVar(&c.NotificationsEnabled, "notifications", c.NotificationsEnabled, "Enable OS notifications")
 	str(&c.DataDir, "data-dir", "Directory for the identity key and database")
+	str(&c.Encryption, "encryption", "Encryption at rest (auto, passphrase, os, off)")
+	str(&c.PassphraseFile, "passphrase-file", "File containing the passphrase")
 	str(&c.DownloadDir, "download-dir", "Directory for downloaded files")
 	fs.Int64Var(&c.MaxFileSize, "max-file-size", c.MaxFileSize, "Largest incoming file in bytes")
 	fs.BoolVar(&c.AutoAcceptFiles, "auto-accept-files", c.AutoAcceptFiles, "Accept incoming files without confirmation")
@@ -273,6 +280,8 @@ Options:
       --broadcast-interval <s>  Seconds between announcements (default 5)
       --data-dir <dir>          Identity key and database directory (default ~/.lazy-chat)
       --db-path <file>          SQLite database path (default <data-dir>/lazy-chat.db)
+      --encryption <mode>       Encryption at rest: auto, passphrase, os or off (default auto)
+      --passphrase-file <file>  Read the passphrase from this file instead of asking
       --download-dir <dir>      Where received files are saved (default downloads)
       --max-file-size <bytes>   Largest incoming file (default 268435456)
       --auto-accept-files       Accept incoming files without confirmation
@@ -339,6 +348,11 @@ func (c *Config) Validate() error {
 	}
 	if c.DownloadDir == "" {
 		return invalid("download_dir", c.DownloadDir, "empty")
+	}
+	switch strings.ToLower(c.Encryption) {
+	case "auto", "passphrase", "os", "off":
+	default:
+		return invalid("encryption", c.Encryption, "must be auto, passphrase, os or off")
 	}
 	if c.MaxFileSize < 1 {
 		return invalid("max_file_size", c.MaxFileSize, "must be positive")
