@@ -1,0 +1,3 @@
+NO RELEASE KEY YET.
+Replace this file with the output of `cosign generate-key-pair` (cosign.pub).
+See RELEASING.md.
