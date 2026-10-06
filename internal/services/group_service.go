@@ -366,6 +366,35 @@ func (gs *GroupService) LeaveGroup(ctx context.Context, groupID string) ([]strin
 	return others, nil
 }
 
+// RemoveMember lets the creator remove another member. It returns every
+// member of the group before the removal (including the removed peer) so the
+// caller can notify them all.
+func (gs *GroupService) RemoveMember(ctx context.Context, groupID, peerID string) ([]string, error) {
+	group, err := gs.GetGroup(ctx, groupID)
+	if err != nil {
+		return nil, err
+	}
+	if group.CreatedBy != gs.selfID {
+		return nil, ErrNotAdmin
+	}
+	if peerID == gs.selfID {
+		return nil, invalid("use leave to remove yourself")
+	}
+	if !group.HasMember(peerID) {
+		return nil, invalid("that peer is not a member")
+	}
+	if err := gs.groups.RemoveGroupMember(ctx, groupID, peerID); err != nil {
+		return nil, fmt.Errorf("failed to remove member: %w", err)
+	}
+	audience := make([]string, 0, len(group.Members))
+	for id := range group.Members {
+		if id != gs.selfID {
+			audience = append(audience, id)
+		}
+	}
+	return audience, nil
+}
+
 // MemberChange is a membership update received from a peer.
 type MemberChange struct {
 	GroupID string

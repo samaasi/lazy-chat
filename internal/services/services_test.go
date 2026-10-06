@@ -305,6 +305,26 @@ func TestApplyUpdateEnforcesWhoMayChangeMembership(t *testing.T) {
 	}
 }
 
+func TestRemoveMember(t *testing.T) {
+	alice, bob, carol, gid := joined(t)
+	if _, err := bob.group.RemoveMember(ctx, gid, carol.id); !errors.Is(err, ErrNotAdmin) {
+		t.Fatalf("member removed another member: %v", err)
+	}
+	if _, err := alice.group.RemoveMember(ctx, gid, alice.id); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("removing yourself: %v", err)
+	}
+	if _, err := alice.group.RemoveMember(ctx, gid, pid(77)); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("removing a stranger: %v", err)
+	}
+	audience, err := alice.group.RemoveMember(ctx, gid, carol.id)
+	if err != nil || len(audience) != 2 {
+		t.Fatalf("remove: %v %v", audience, err)
+	}
+	if ok, _ := alice.group.IsMember(ctx, gid, carol.id); ok {
+		t.Fatal("removed member can still post")
+	}
+}
+
 func TestLeaveGroup(t *testing.T) {
 	alice, bob, carol, gid := joined(t)
 	_ = alice

@@ -1,256 +1,400 @@
+// Package messaging implements chat on top of the authenticated transport:
+// direct messages, group messages and the group membership protocol.
+//
+// Everything arriving from the network is treated as hostile. The only thing
+// taken from a peer's frame about *who sent it* is the connection's
+// authenticated identity; claimed senders, timestamps and delivery flags in
+// the payload are overwritten or ignored.
 package messaging
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 
-	"github.com/samaasi/lazy-chat/internal/errors"
+	apperrors "github.com/samaasi/lazy-chat/internal/errors"
 	"github.com/samaasi/lazy-chat/internal/interfaces"
 	"github.com/samaasi/lazy-chat/internal/models"
+	"github.com/samaasi/lazy-chat/internal/protocol"
 	"github.com/samaasi/lazy-chat/internal/services"
 	"github.com/samaasi/lazy-chat/internal/storage"
+	"github.com/samaasi/lazy-chat/internal/utils"
 )
 
-// Handler implements the MessageHandler interface
+const (
+	// MaxMessageBytes is the largest message body accepted or sent.
+	MaxMessageBytes = 4096
+	// maxWireIDLen bounds identifiers received from the network.
+	maxWireIDLen = 64
+	// opTimeout bounds each network or database operation done on behalf of
+	// an incoming frame.
+	opTimeout = 10 * time.Second
+	// maxSendFanout caps concurrent connection attempts for one group message.
+	maxSendFanout = 8
+)
+
+// Printer receives lines meant for the user.
+type Printer interface {
+	Printf(format string, args ...any)
+}
+
+// Deps are the collaborators a Handler needs.
+type Deps struct {
+	Logger   interfaces.Logger
+	SelfID   string
+	SelfName string
+	Net      interfaces.NetworkManager
+	Store    storage.MessageStorage
+	Groups   *services.GroupService
+	Peers    interfaces.PeerManager
+	Notifier interfaces.NotificationManager
+	Out      Printer
+}
+
+// Handler processes chat traffic. It is safe for concurrent use.
 type Handler struct {
-	logger               interfaces.Logger
-	callback             func(*models.ChatMessage)
-	notificationMgr      interfaces.NotificationManager
-	messageStorage       storage.MessageStorage
-	groupService         *services.GroupService
-	groupMessageCallback func(*models.ChatMessage)
-	idGenerator          interfaces.IDGenerator
-	netManager           interfaces.NetworkManager
+	Deps
+	now func() time.Time
+
+	mu     sync.Mutex
+	closed bool
+	wg     sync.WaitGroup
+
+	// names remembers the last display name seen per peer, so a peer that
+	// just disconnected can still be named in the "disconnected" line.
+	names sync.Map // peer ID -> string
 }
 
-// NewHandler creates a new message handler
-func NewHandler(logger interfaces.Logger, notificationMgr interfaces.NotificationManager, messageStorage storage.MessageStorage, groupService *services.GroupService, idGenerator interfaces.IDGenerator, netManager interfaces.NetworkManager) *Handler {
-	return &Handler{
-		logger:          logger,
-		notificationMgr: notificationMgr,
-		messageStorage:  messageStorage,
-		groupService:    groupService,
-		idGenerator:     idGenerator,
-		netManager:      netManager,
+var _ interfaces.PeerListener = (*Handler)(nil)
+
+// NewHandler creates a handler. Call Register to attach it to the network.
+func NewHandler(d Deps) *Handler {
+	return &Handler{Deps: d, now: time.Now}
+}
+
+// Register installs the frame handlers on the network manager and subscribes
+// to peer events.
+func (h *Handler) Register() {
+	h.Net.Handle(protocol.KindMessage, h.onMessage)
+	h.Net.Handle(protocol.KindAck, h.onAck)
+	h.Net.Handle(protocol.KindGroupInvite, h.onGroupInvite)
+	h.Net.Handle(protocol.KindGroupInviteReply, h.onGroupInviteReply)
+	h.Net.Handle(protocol.KindGroupUpdate, h.onGroupUpdate)
+	h.Net.AddListener(h)
+}
+
+// Close waits for background work (acknowledgements, fan-out) to finish.
+func (h *Handler) Close() {
+	h.mu.Lock()
+	h.closed = true
+	h.mu.Unlock()
+	h.wg.Wait()
+}
+
+// background runs fn on a tracked goroutine, unless the handler is closed.
+func (h *Handler) background(fn func(ctx context.Context)) {
+	h.mu.Lock()
+	if h.closed {
+		h.mu.Unlock()
+		return
 	}
+	h.wg.Add(1)
+	h.mu.Unlock()
+
+	go func() {
+		defer h.wg.Done()
+		ctx, cancel := context.WithTimeout(context.Background(), opTimeout)
+		defer cancel()
+		fn(ctx)
+	}()
 }
 
-// HandleMessage processes incoming messages
-func (h *Handler) HandleMessage(msg *models.ChatMessage) {
-	if err := h.ValidateMessage(msg); err != nil {
-		h.logger.Error("Invalid message received", "error", err)
+// ---- Validation ------------------------------------------------------------
+
+// ValidateContent checks the text of a message.
+func ValidateContent(text string) error {
+	switch {
+	case strings.TrimSpace(text) == "":
+		return apperrors.ErrMessageEmpty
+	case len(text) > MaxMessageBytes:
+		return apperrors.ErrMessageTooLarge.WithContext("length", len(text)).WithContext("max_length", MaxMessageBytes)
+	case !utf8.ValidString(text):
+		return apperrors.ErrMessageInvalid.WithContext("reason", "not valid UTF-8")
+	}
+	return nil
+}
+
+// validWireID reports whether s is acceptable as an identifier from the network.
+func validWireID(s string) bool {
+	if s == "" || len(s) > maxWireIDLen {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '_') {
+			return false
+		}
+	}
+	return true
+}
+
+// ---- Names -----------------------------------------------------------------
+
+func shortID(id string) string {
+	if len(id) > 8 {
+		return id[:8]
+	}
+	return id
+}
+
+// DisplayName renders a peer as "name (abcd1234)". The ID suffix keeps
+// look-alike names distinguishable; the name is sanitised.
+func (h *Handler) DisplayName(peerID string) string {
+	if peerID == h.SelfID {
+		return "you"
+	}
+	name, ok := h.Net.PeerName(peerID)
+	if !ok {
+		if cached, found := h.names.Load(peerID); found {
+			name = cached.(string)
+		} else if p, found := h.Peers.GetPeer(peerID); found {
+			name = p.Username
+		}
+	}
+	name = utils.SanitizeText(name, 32)
+	if name == "" {
+		name = "unknown"
+	}
+	return fmt.Sprintf("%s (%s)", name, shortID(peerID))
+}
+
+// ---- Receiving chat messages -----------------------------------------------
+
+func (h *Handler) onMessage(from string, body []byte) {
+	var msg models.ChatMessage
+	if err := protocol.Unmarshal(body, &msg); err != nil {
+		h.Logger.Debug("Malformed message", "peer", shortID(from), "error", err)
 		return
 	}
 
-	// Store the received message
-	if h.messageStorage != nil {
-		err := h.messageStorage.SaveMessage(context.Background(), msg)
-		if err != nil {
-			h.logger.Error("Failed to store received message", "error", err)
-		}
-	}
+	ctx, cancel := context.WithTimeout(context.Background(), opTimeout)
+	defer cancel()
 
-	h.logger.Info("Message received", "from", msg.From, "content", msg.Message)
-
-	// Handle based on message type
-	if msg.IsGroupMessage() {
-		h.handleGroupMessage(msg)
-	} else {
-		h.handleDirectMessage(msg)
-	}
-}
-
-// handleDirectMessage processes direct messages
-func (h *Handler) handleDirectMessage(msg *models.ChatMessage) {
-	if h.callback != nil {
-		h.callback(msg)
-	}
-
-	// Display the message to the user
-	h.displayMessage(msg)
-
-	if h.notificationMgr != nil {
-		if err := h.notificationMgr.NotifyMessageReceived(msg.From, msg.Message); err != nil {
-			h.logger.Debug("Failed to send notification", "error", err)
-		}
-	}
-}
-
-// handleGroupMessage processes group messages
-func (h *Handler) handleGroupMessage(msg *models.ChatMessage) {
-	// Verify the sender is a member of the group
-	if h.groupService != nil && msg.GroupID != "" {
-		members, err := h.groupService.GetGroupMembers(msg.GroupID)
-		if err != nil {
-			h.logger.Error("Failed to verify group membership", "error", err)
-			return
-		}
-
-		// Check if sender is a member
-		isMember := false
-		for _, member := range members {
-			if member.PeerID == msg.From {
-				isMember = true
-				break
-			}
-		}
-
-		if !isMember {
-			h.logger.Warn("Received group message from non-member", "from", msg.From, "groupID", msg.GroupID)
-			return
-		}
-	}
-
-	if h.groupMessageCallback != nil {
-		h.groupMessageCallback(msg)
-	}
-
-	// Display the message to the user
-	h.displayMessage(msg)
-
-	if h.notificationMgr != nil {
-		if err := h.notificationMgr.NotifyMessageReceived(msg.From, fmt.Sprintf("Group: %s", msg.Message)); err != nil {
-			h.logger.Debug("Failed to send group notification", "error", err)
-		}
-	}
-}
-
-// displayMessage formats and displays a chat message
-func (h *Handler) displayMessage(msg *models.ChatMessage) {
-	// Format timestamp for display
-	timestamp := msg.Timestamp.Format("15:04:05")
-
-	// Display the formatted message
-	fmt.Printf("[%s] %s: %s\n", timestamp, msg.From, msg.Message)
-}
-
-// SendMessage sends a message to a specific peer
-func (h *Handler) SendMessage(to, content string) error {
-	message := models.NewChatMessage(h.idGenerator.GenerateID(), "", to, content)
-
-	if err := h.ValidateMessage(message); err != nil {
-		return err
-	}
-
-	// Store the message
-	if h.messageStorage != nil {
-		err := h.messageStorage.SaveMessage(context.Background(), message)
-		if err != nil {
-			h.logger.Debug("Failed to store message", "error", err)
-		}
-	}
-
-	h.logger.Debug("Sending message", "to", to, "content", content)
-
-	// Here you would implement the actual network sending logic
-	// For now, we'll just log it
-	h.logger.Debug("Message sent successfully")
-
-	return nil
-}
-
-// SendGroupMessage sends a message to a group
-func (h *Handler) SendGroupMessage(groupID, content string) error {
-	message := models.NewChatMessage(h.idGenerator.GenerateID(), "", groupID, content)
-	message.Type = models.MessageTypeGroup
-	message.GroupID = groupID
-
-	if err := h.ValidateMessage(message); err != nil {
-		return err
-	}
-
-	// Get group members
-	if h.groupService == nil {
-		return fmt.Errorf("group service not available")
-	}
-
-	members, err := h.groupService.GetGroupMembers(groupID)
+	group, err := h.checkInbound(ctx, from, &msg)
 	if err != nil {
-		return fmt.Errorf("failed to get group members: %w", err)
+		h.Logger.Debug("Rejected message", "peer", shortID(from), "reason", err.Error())
+		return
 	}
 
-	if len(members) == 0 {
-		return fmt.Errorf("no members found in group %s", groupID)
+	inserted, err := h.Store.SaveMessage(ctx, &msg)
+	if err != nil {
+		// No acknowledgement: the sender will see it as undelivered.
+		h.Logger.Error("Failed to store received message", "error", err)
+		return
 	}
 
-	// Store the message
-	if h.messageStorage != nil {
-		err := h.messageStorage.SaveMessage(context.Background(), message)
+	// Acknowledge even duplicates, in case our earlier ack was lost.
+	id := msg.ID
+	h.background(func(ctx context.Context) {
+		if err := h.Net.SendJSON(ctx, from, protocol.KindAck, protocol.Ack{MessageID: id}); err != nil {
+			h.Logger.Debug("Failed to acknowledge message", "peer", shortID(from), "error", err)
+		}
+	})
+	if !inserted {
+		return
+	}
+	h.display(&msg, group)
+}
+
+// checkInbound validates a received message and rewrites the fields the
+// sender must not control. It returns the group for group messages.
+func (h *Handler) checkInbound(ctx context.Context, from string, msg *models.ChatMessage) (*models.Group, error) {
+	// Authoritative values, regardless of what the payload claimed.
+	msg.Seq = 0
+	msg.From = from
+	msg.Timestamp = h.now()
+	msg.Delivered, msg.Read = true, false
+
+	if !validWireID(msg.ID) {
+		return nil, errors.New("bad message id")
+	}
+	if err := ValidateContent(msg.Message); err != nil {
+		return nil, err
+	}
+
+	switch msg.Type {
+	case models.MessageTypeDirect:
+		if msg.To != h.SelfID || msg.GroupID != "" {
+			return nil, errors.New("direct message not addressed to us")
+		}
+		return nil, nil
+
+	case models.MessageTypeGroup:
+		if msg.To != "" || !validWireID(msg.GroupID) {
+			return nil, errors.New("malformed group message")
+		}
+		// Membership is checked against *our* records, before anything is
+		// stored, using the authenticated sender.
+		group, err := h.Groups.GetGroup(ctx, msg.GroupID)
 		if err != nil {
-			h.logger.Debug("Failed to store group message", "error", err)
+			return nil, fmt.Errorf("group %s: %w", shortID(msg.GroupID), err)
 		}
+		if !group.HasMember(from) {
+			return nil, errors.New("sender is not a member of the group")
+		}
+		return group, nil
+
+	default:
+		// "system" messages are local-only; peers may not send them.
+		return nil, fmt.Errorf("message type %q not accepted from peers", msg.Type)
 	}
+}
 
-	h.logger.Debug("Sending group message", "groupID", groupID, "content", content, "member_count", len(members))
+func (h *Handler) display(msg *models.ChatMessage, group *models.Group) {
+	ts := msg.Timestamp.Format("15:04:05")
+	text := utils.SanitizeText(msg.Message, 0)
 
-	// Send message to all group members via network manager
-	if h.netManager != nil {
-		// Extract peer IDs from group members
-		var peerIDs []string
-		for _, member := range members {
-			// Skip sending to self
-			if member.PeerID != message.From {
-				peerIDs = append(peerIDs, member.PeerID)
+	who := h.DisplayName(msg.From)
+	if group != nil {
+		// A peer we have no live connection to is still named in the roster.
+		if _, known := h.Net.PeerName(msg.From); !known {
+			if rosterName := group.Members[msg.From]; rosterName != "" {
+				who = fmt.Sprintf("%s (%s)", utils.SanitizeText(rosterName, 32), shortID(msg.From))
 			}
 		}
-
-		if len(peerIDs) > 0 {
-			err = h.netManager.SendGroupMessage(peerIDs, message)
-			if err != nil {
-				h.logger.Error("Failed to send group message", "groupID", groupID, "error", err)
-				return fmt.Errorf("failed to send group message: %w", err)
-			}
-		}
+		h.Out.Printf("[%s] [%s] %s: %s", ts, utils.SanitizeText(group.Name, models.MaxGroupNameLen), who, text)
+	} else {
+		h.Out.Printf("[%s] %s: %s", ts, who, text)
 	}
+	if h.Notifier != nil {
+		prefix := who
+		if group != nil {
+			prefix = group.Name + " / " + who
+		}
+		_ = h.Notifier.NotifyMessageReceived(prefix, text)
+	}
+}
 
-	h.logger.Debug("Group message sent successfully", "groupID", groupID)
+func (h *Handler) onAck(from string, body []byte) {
+	var ack protocol.Ack
+	if err := protocol.Unmarshal(body, &ack); err != nil || !validWireID(ack.MessageID) {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), opTimeout)
+	defer cancel()
+	// Only messages we sent can be marked: the store scopes this to SelfID.
+	if err := h.Store.MarkMessageAsDelivered(ctx, h.SelfID, ack.MessageID); err != nil && !errors.Is(err, storage.ErrNotFound) {
+		h.Logger.Debug("Failed to record delivery", "error", err)
+	}
+}
+
+// ---- Sending chat messages -------------------------------------------------
+
+// SendMessage stores and sends a direct message. If the peer cannot be
+// reached the message stays in history marked undelivered and an error is
+// returned.
+func (h *Handler) SendMessage(ctx context.Context, peerID, content string) error {
+	if err := ValidateContent(content); err != nil {
+		return err
+	}
+	msg := models.NewChatMessage(utils.NewID(), h.SelfID, peerID, content)
+	if _, err := h.Store.SaveMessage(ctx, msg); err != nil {
+		return fmt.Errorf("could not save message: %w", err)
+	}
+	if err := h.Net.SendJSON(ctx, peerID, protocol.KindMessage, msg); err != nil {
+		return fmt.Errorf("message saved but not delivered: %w", err)
+	}
 	return nil
 }
 
-// SetMessageCallback sets a callback for message processing
-func (h *Handler) SetMessageCallback(callback func(*models.ChatMessage)) {
-	h.callback = callback
+// GroupSendResult reports per-member outcomes of a group message.
+type GroupSendResult struct {
+	Queued []string
+	Failed map[string]error
 }
 
-// SetGroupMessageCallback sets the callback function for received group messages
-func (h *Handler) SetGroupMessageCallback(callback func(*models.ChatMessage)) {
-	h.groupMessageCallback = callback
+// SendGroupMessage stores a message and sends it to every other member.
+// It returns an error only when the message could not be stored or reached
+// nobody; partial failures are in the result.
+func (h *Handler) SendGroupMessage(ctx context.Context, groupID, content string) (*GroupSendResult, error) {
+	if err := ValidateContent(content); err != nil {
+		return nil, err
+	}
+	targets, err := h.Groups.BroadcastTargets(ctx, groupID)
+	if err != nil {
+		return nil, err
+	}
+
+	msg := models.NewGroupMessage(utils.NewID(), h.SelfID, groupID, content)
+	if _, err := h.Store.SaveMessage(ctx, msg); err != nil {
+		return nil, fmt.Errorf("could not save message: %w", err)
+	}
+
+	res := &GroupSendResult{Failed: make(map[string]error)}
+	var mu sync.Mutex
+	h.fanOut(ctx, targets, func(ctx context.Context, peerID string) error {
+		return h.Net.SendJSON(ctx, peerID, protocol.KindMessage, msg)
+	}, func(peerID string, err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if err != nil {
+			res.Failed[peerID] = err
+		} else {
+			res.Queued = append(res.Queued, peerID)
+		}
+	})
+
+	if len(targets) > 0 && len(res.Queued) == 0 {
+		return res, fmt.Errorf("message saved but not delivered to anyone: %w", firstError(res.Failed))
+	}
+	return res, nil
 }
 
-// ValidateMessage checks if a message is valid
-func (h *Handler) ValidateMessage(msg *models.ChatMessage) error {
-	if msg == nil {
-		return fmt.Errorf("message is nil")
+func firstError(m map[string]error) error {
+	for _, err := range m {
+		return err
 	}
-
-	if msg.From == "" {
-		return fmt.Errorf("message sender is empty")
-	}
-
-	// Validate message content
-	if strings.TrimSpace(msg.Message) == "" {
-		return errors.ErrMessageValidation.WithContext("reason", "empty_content")
-	}
-
-	if len(msg.Message) > 1000 {
-		return errors.ErrMessageValidation.WithContext("reason", "content_too_long").WithContext("length", len(msg.Message)).WithContext("max_length", 1000)
-	}
-
-	if msg.Timestamp.IsZero() {
-		return fmt.Errorf("message timestamp is invalid")
-	}
-
-	// Check if timestamp is too far in the future (more than 1 minute)
-	if msg.Timestamp.After(time.Now().Add(time.Minute)) {
-		return fmt.Errorf("message timestamp is too far in the future")
-	}
-
-	// Check if timestamp is too old (more than 24 hours)
-	if msg.Timestamp.Before(time.Now().Add(-24 * time.Hour)) {
-		return fmt.Errorf("message timestamp is too old")
-	}
-
 	return nil
+}
+
+// fanOut runs send for each target with bounded concurrency (dialing an
+// offline peer can take seconds, and a group should not wait for them one by one).
+func (h *Handler) fanOut(ctx context.Context, targets []string, send func(context.Context, string) error, done func(string, error)) {
+	sem := make(chan struct{}, maxSendFanout)
+	var wg sync.WaitGroup
+	for _, peerID := range targets {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			done(peerID, send(ctx, peerID))
+		}()
+	}
+	wg.Wait()
+}
+
+// ---- Peer events -----------------------------------------------------------
+
+// PeerConnected implements interfaces.PeerListener.
+func (h *Handler) PeerConnected(peerID, username string) {
+	h.names.Store(peerID, utils.SanitizeText(username, 32))
+	name := h.DisplayName(peerID)
+	h.Out.Printf("* %s connected", name)
+	if h.Notifier != nil {
+		_ = h.Notifier.NotifyPeerConnected(name)
+	}
+}
+
+// PeerDisconnected implements interfaces.PeerListener.
+func (h *Handler) PeerDisconnected(peerID string) {
+	name := h.DisplayName(peerID)
+	h.Out.Printf("* %s disconnected", name)
+	if h.Notifier != nil {
+		_ = h.Notifier.NotifyPeerDisconnected(name)
+	}
 }
