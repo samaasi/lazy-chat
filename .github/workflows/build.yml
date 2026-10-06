@@ -1,132 +1,169 @@
-name: Build Cross-Platform Executables
+name: CI and Release
 
 on:
   push:
     branches: [ master, develop ]
     tags: [ 'v*' ]
   pull_request:
-    branches: [ master ]
+    branches: [ master, develop ]
   workflow_dispatch:
 
+# Least privilege by default; the release job opts in to what it needs.
+permissions:
+  contents: read
+
+env:
+  GOFLAGS: -mod=readonly
+
 jobs:
-  build:
-    name: Build for ${{ matrix.os }}-${{ matrix.arch }}
+  test:
+    name: Test (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
     strategy:
+      fail-fast: false
       matrix:
-        include:
-          # Windows
-          - os: windows
-            arch: amd64
-            runner: windows-latest
-            ext: .exe
-          # macOS Intel
-          - os: darwin
-            arch: amd64
-            runner: macos-latest
-            ext: ''
-          # macOS ARM (Apple Silicon)
-          - os: darwin
-            arch: arm64
-            runner: macos-latest
-            ext: ''
-          # Linux
-          - os: linux
-            arch: amd64
-            runner: ubuntu-latest
-            ext: ''
-          # Linux ARM64
-          - os: linux
-            arch: arm64
-            runner: ubuntu-latest
-            ext: ''
-
+        runner: [ ubuntu-latest, windows-latest, macos-latest ]
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
-    - name: Set up Go
-      uses: actions/setup-go@v4
-      with:
-        go-version: '1.24'
-        check-latest: true
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
 
-    - name: Cache Go modules
-      uses: actions/cache@v3
-      with:
-        path: |
-          ~/.cache/go-build
-          ~/go/pkg/mod
-        key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
-        restore-keys: |
-          ${{ runner.os }}-go-
+      - name: Vet
+        run: go vet ./...
 
-    - name: Download dependencies
-      run: go mod download
+      # -race needs cgo; the shipped binaries are built without it below.
+      - name: Test (race detector)
+        env:
+          CGO_ENABLED: 1
+        run: go test -race -count=1 ./...
 
-    - name: Run tests
-      run: go test -v ./...
+      - name: Test (release configuration, no cgo)
+        env:
+          CGO_ENABLED: 0
+        run: go test -count=1 ./...
 
-    - name: Build executable
-      env:
-        GOOS: ${{ matrix.os }}
-        GOARCH: ${{ matrix.arch }}
-        CGO_ENABLED: 0
-      run: |
-        go build -v -ldflags "-s -w -X main.version=${{ github.ref_name }}" -o lazy-chat-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext }} ./cmd
+  vulncheck:
+    name: Vulnerability scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
-    - name: Create release directory
-      run: |
-        mkdir -p release
-        cp lazy-chat-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext }} release/
-        cp config.example.json release/
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
 
-    - name: Upload artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: lazy-chat-${{ matrix.os }}-${{ matrix.arch }}
-        path: release/
-        retention-days: 30
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+  # Builds every release archive exactly as the release job would, minus
+  # signing and publishing, so a broken .goreleaser.yaml fails here and not on
+  # release day. The updater and the install scripts depend on the archive names.
+  snapshot:
+    name: Release dry run
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+
+      - name: Check configuration
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          version: "~> v2"
+          args: check
+
+      - name: Build all platforms
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          version: "~> v2"
+          args: release --snapshot --clean --skip=publish,sign
+
+      - name: Archive names match what the updater and installers expect
+        run: |
+          set -eu
+          ver=$(ls dist/lazy-chat_*_linux_amd64.tar.gz | sed -E 's/.*lazy-chat_(.*)_linux_amd64.tar.gz/\1/')
+          for t in linux_amd64.tar.gz linux_arm64.tar.gz darwin_amd64.tar.gz darwin_arm64.tar.gz windows_amd64.zip windows_arm64.zip; do
+            test -f "dist/lazy-chat_${ver}_${t}" || { echo "missing lazy-chat_${ver}_${t}"; exit 1; }
+          done
+          test -f dist/checksums.txt
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: snapshot
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/checksums.txt
+          retention-days: 14
 
   release:
-    name: Create Release
-    needs: build
+    name: Publish release
+    needs: [ test, vulncheck ]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
-    
+    permissions:
+      contents: write
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
-    - name: Download all artifacts
-      uses: actions/download-artifact@v4
-      with:
-        path: artifacts
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
 
-    - name: Create release archives
-      run: |
-        cd artifacts
-        for dir in */; do
-          if [ -d "$dir" ]; then
-            cd "$dir"
-            if [[ "$dir" == *"windows"* ]]; then
-              zip -r "../lazy-chat-${dir%/}.zip" .
-            else
-              tar -czf "../lazy-chat-${dir%/}.tar.gz" .
-            fi
-            cd ..
-          fi
-        done
-        ls -la *.zip *.tar.gz
+      # A release that cannot verify its own updates would strand every user.
+      - name: The program must carry the public key that matches the signing key
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+        run: |
+          set -eu
+          grep -q 'BEGIN PUBLIC KEY' internal/update/release.pub || { echo "internal/update/release.pub is not a public key; see RELEASING.md"; exit 1; }
+          test -n "$COSIGN_PRIVATE_KEY" || { echo "secret COSIGN_PRIVATE_KEY is not set; see RELEASING.md"; exit 1; }
 
-    - name: Create GitHub Release
-      uses: softprops/action-gh-release@v1
-      with:
-        files: |
-          artifacts/*.zip
-          artifacts/*.tar.gz
-        draft: false
-        prerelease: ${{ contains(github.ref, 'alpha') || contains(github.ref, 'beta') || contains(github.ref, 'rc') }}
-        generate_release_notes: true
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Build, sign and publish
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+          # Pushes the Homebrew cask and Scoop manifest (repo scope on the tap and bucket repos).
+          TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+
+      - name: Verify the published signature with the key shipped in the source
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME}"
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}"
+          curl -fsSL -o checksums.txt "${base}/checksums.txt"
+          curl -fsSL -o checksums.txt.sig "${base}/checksums.txt.sig"
+          openssl base64 -d -A -in checksums.txt.sig -out sig.der
+          openssl dgst -sha256 -verify internal/update/release.pub -signature sig.der checksums.txt

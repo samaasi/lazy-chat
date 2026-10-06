@@ -3,169 +3,191 @@ package ui
 import (
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 )
 
-// ProgressBar represents a console progress bar
+// Display is where progress bars are drawn; *Console satisfies it.
+type Display interface {
+	Status(line string)
+	EndStatus()
+}
+
+const (
+	barWidth       = 30
+	redrawInterval = 200 * time.Millisecond
+)
+
+// ProgressBar represents a console progress bar. It is safe for concurrent use.
 type ProgressBar struct {
-	title       string
-	total       int64
-	current     int64
-	width       int
-	startTime   time.Time
-	lastUpdate  time.Time
-	updateRate  time.Duration
-	completed   bool
+	mu         sync.Mutex
+	title      string
+	total      int64
+	current    int64
+	startTime  time.Time
+	lastDraw   time.Time
+	display    Display
+	completed  bool
+	now        func() time.Time
+	drawnOnce  bool
+	showOnDone bool
 }
 
-// NewProgressBar creates a new progress bar
-func NewProgressBar(title string, total int64) *ProgressBar {
-	return &ProgressBar{
-		title:      title,
-		total:      total,
-		width:      50,
-		startTime:  time.Now(),
-		lastUpdate: time.Now(),
-		updateRate: 100 * time.Millisecond, // Update every 100ms
-	}
+// NewProgressBar creates a progress bar drawn on display.
+func NewProgressBar(display Display, title string, total int64) *ProgressBar {
+	return &ProgressBar{title: title, total: total, display: display, now: time.Now, startTime: time.Now()}
 }
 
-// Update updates the progress bar with new progress
+// Update sets the current progress and redraws if enough time has passed.
 func (pb *ProgressBar) Update(current int64) {
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+	if pb.completed {
+		return
+	}
 	pb.current = current
-	now := time.Now()
-	
-	// Only update display if enough time has passed or if completed
-	if now.Sub(pb.lastUpdate) >= pb.updateRate || current >= pb.total {
-		pb.display()
-		pb.lastUpdate = now
-	}
-	
-	if current >= pb.total {
-		pb.completed = true
+	now := pb.now()
+	if now.Sub(pb.lastDraw) >= redrawInterval {
+		pb.draw(now)
 	}
 }
 
-// Finish marks the progress bar as completed
+// Finish marks the progress bar as completed and ends its line.
 func (pb *ProgressBar) Finish() {
-	pb.current = pb.total
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+	if pb.completed {
+		return
+	}
 	pb.completed = true
-	pb.display()
-	fmt.Println() // Add a newline after completion
+	pb.current = pb.total
+	pb.draw(pb.now())
+	pb.display.EndStatus()
 }
 
-// display renders the progress bar to the console
-func (pb *ProgressBar) display() {
-	percentage := float64(pb.current) / float64(pb.total) * 100
-	if percentage > 100 {
-		percentage = 100
+// Abort stops the bar without claiming success.
+func (pb *ProgressBar) Abort() {
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+	if pb.completed {
+		return
 	}
-	
-	// Calculate filled width
-	filledWidth := int(float64(pb.width) * percentage / 100)
-	
-	// Create progress bar string
-	bar := "["
-	bar += strings.Repeat("=", filledWidth)
-	if filledWidth < pb.width {
-		bar += ">"
-		bar += strings.Repeat(" ", pb.width-filledWidth-1)
+	pb.completed = true
+	if pb.drawnOnce {
+		pb.display.EndStatus()
 	}
-	bar += "]"
-	
-	// Calculate transfer rate and ETA
-	elapsed := time.Since(pb.startTime)
+}
+
+func (pb *ProgressBar) draw(now time.Time) {
+	pb.lastDraw = now
+	pb.drawnOnce = true
+	pb.display.Status(pb.render(now))
+}
+
+// render builds the progress line. The caller holds pb.mu.
+func (pb *ProgressBar) render(now time.Time) string {
+	fraction := 1.0
+	if pb.total > 0 {
+		fraction = float64(pb.current) / float64(pb.total)
+	}
+	fraction = max(0, min(1, fraction))
+
+	filled := int(fraction * barWidth)
+	bar := strings.Repeat("=", filled)
+	if filled < barWidth {
+		bar += ">" + strings.Repeat(" ", barWidth-filled-1)
+	}
+
+	elapsed := now.Sub(pb.startTime).Seconds()
 	var rate float64
-	var eta string
-	
-	if elapsed.Seconds() > 0 {
-		rate = float64(pb.current) / elapsed.Seconds()
-		if rate > 0 && pb.current < pb.total {
-			remaining := float64(pb.total-pb.current) / rate
-			eta = formatDuration(time.Duration(remaining) * time.Second)
-		} else {
-			eta = "--:--"
-		}
-	} else {
-		eta = "--:--"
+	if elapsed > 0 {
+		rate = float64(pb.current) / elapsed
 	}
-	
-	// Format the complete progress line
-	progressLine := fmt.Sprintf("\r%s %s %.1f%% (%s/%s) %s/s ETA: %s",
-		pb.title,
-		bar,
-		percentage,
-		formatBytes(pb.current),
-		formatBytes(pb.total),
-		formatBytes(int64(rate)),
-		eta,
-	)
-	
-	fmt.Print(progressLine)
+	eta := "--:--"
+	if rate > 0 && pb.current < pb.total {
+		eta = formatDuration(time.Duration(float64(pb.total-pb.current)/rate) * time.Second)
+	}
+
+	return fmt.Sprintf("%s [%s] %5.1f%% %s/%s %s/s ETA %s",
+		pb.title, bar, fraction*100, formatBytes(pb.current), formatBytes(pb.total), formatBytes(int64(rate)), eta)
 }
 
-// formatBytes formats bytes into human readable format
+// FormatBytes formats a byte count in binary units.
+func FormatBytes(n int64) string { return formatBytes(n) }
+
 func formatBytes(bytes int64) string {
 	const unit = 1024
 	if bytes < unit {
 		return fmt.Sprintf("%d B", bytes)
 	}
-	
 	div, exp := int64(unit), 0
-	for n := bytes / unit; n >= unit; n /= unit {
+	for n := bytes / unit; n >= unit && exp < 5; n /= unit {
 		div *= unit
 		exp++
 	}
-	
-	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
+	return fmt.Sprintf("%.1f %ciB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }
 
-// formatDuration formats duration into human readable format
 func formatDuration(d time.Duration) string {
-	totalSeconds := int(d.Seconds())
-	hours := totalSeconds / 3600
-	minutes := (totalSeconds % 3600) / 60
-	seconds := totalSeconds % 60
-	
-	if hours > 0 {
-		return fmt.Sprintf("%d:%02d:%02d", hours, minutes, seconds)
+	total := int(d.Seconds())
+	h, m, s := total/3600, total%3600/60, total%60
+	if h > 0 {
+		return fmt.Sprintf("%d:%02d:%02d", h, m, s)
 	}
-	return fmt.Sprintf("%d:%02d", minutes, seconds)
+	return fmt.Sprintf("%d:%02d", m, s)
 }
 
-// MultiProgressManager manages multiple progress bars
+// MultiProgressManager manages several progress bars by ID. Safe for
+// concurrent use.
 type MultiProgressManager struct {
-	bars map[string]*ProgressBar
+	mu      sync.Mutex
+	display Display
+	bars    map[string]*ProgressBar
 }
 
-// NewMultiProgressManager creates a new multi-progress manager
-func NewMultiProgressManager() *MultiProgressManager {
-	return &MultiProgressManager{
-		bars: make(map[string]*ProgressBar),
-	}
+// NewMultiProgressManager creates a manager that draws on display.
+func NewMultiProgressManager(display Display) *MultiProgressManager {
+	return &MultiProgressManager{display: display, bars: make(map[string]*ProgressBar)}
 }
 
 // AddProgress adds a new progress bar
-func (mpm *MultiProgressManager) AddProgress(id, title string, total int64) {
-	mpm.bars[id] = NewProgressBar(title, total)
+func (m *MultiProgressManager) AddProgress(id, title string, total int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.bars[id] = NewProgressBar(m.display, title, total)
+}
+
+func (m *MultiProgressManager) get(id string) *ProgressBar {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.bars[id]
 }
 
 // UpdateProgress updates a specific progress bar
-func (mpm *MultiProgressManager) UpdateProgress(id string, current int64) {
-	if bar, exists := mpm.bars[id]; exists {
+func (m *MultiProgressManager) UpdateProgress(id string, current int64) {
+	if bar := m.get(id); bar != nil {
 		bar.Update(current)
 	}
 }
 
-// FinishProgress marks a progress bar as completed
-func (mpm *MultiProgressManager) FinishProgress(id string) {
-	if bar, exists := mpm.bars[id]; exists {
+// FinishProgress completes a bar and forgets it.
+func (m *MultiProgressManager) FinishProgress(id string) {
+	m.mu.Lock()
+	bar := m.bars[id]
+	delete(m.bars, id)
+	m.mu.Unlock()
+	if bar != nil {
 		bar.Finish()
-		delete(mpm.bars, id)
 	}
 }
 
-// RemoveProgress removes a progress bar
-func (mpm *MultiProgressManager) RemoveProgress(id string) {
-	delete(mpm.bars, id)
+// RemoveProgress forgets a bar without completing it.
+func (m *MultiProgressManager) RemoveProgress(id string) {
+	m.mu.Lock()
+	bar := m.bars[id]
+	delete(m.bars, id)
+	m.mu.Unlock()
+	if bar != nil {
+		bar.Abort()
+	}
 }

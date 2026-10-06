@@ -4,37 +4,70 @@ import (
 	"time"
 )
 
+// Roles within a group. The creator is the only admin.
+const (
+	RoleAdmin  = "admin"
+	RoleMember = "member"
+)
+
+// Invite lifecycle states.
+const (
+	InviteStatusPending  = "pending"
+	InviteStatusAccepted = "accepted"
+	InviteStatusDeclined = "declined"
+	InviteStatusExpired  = "expired"
+)
+
+// Limits applied to group data, locally and on everything received.
+const (
+	MaxGroupNameLen        = 64
+	MaxGroupDescriptionLen = 256
+	MaxGroupMembers        = 256
+)
+
 // Group represents a chat group
 type Group struct {
-	ID          string            `json:"id" db:"id"`
-	Name        string            `json:"name" db:"name"`
-	Description string            `json:"description" db:"description"`
-	CreatedBy   string            `json:"created_by" db:"created_by"`
-	CreatedAt   time.Time         `json:"created_at" db:"created_at"`
-	UpdatedAt   time.Time         `json:"updated_at" db:"updated_at"`
-	Members     map[string]string `json:"members" db:"-"` // PeerID -> Username mapping
-	IsActive    bool              `json:"is_active" db:"is_active"`
+	ID          string            `json:"id"`
+	Name        string            `json:"name"`
+	Description string            `json:"description"`
+	CreatedBy   string            `json:"created_by"`
+	CreatedAt   time.Time         `json:"created_at"`
+	UpdatedAt   time.Time         `json:"updated_at"`
+	Members     map[string]string `json:"members"` // PeerID -> Username mapping (active members)
+	IsActive    bool              `json:"is_active"`
 }
 
 // GroupMember represents a member of a group
 type GroupMember struct {
-	GroupID   string    `json:"group_id" db:"group_id"`
-	PeerID    string    `json:"peer_id" db:"peer_id"`
-	Username  string    `json:"username" db:"username"`
-	JoinedAt  time.Time `json:"joined_at" db:"joined_at"`
-	Role      string    `json:"role" db:"role"` // "admin", "member"
-	IsActive  bool      `json:"is_active" db:"is_active"`
+	GroupID  string    `json:"group_id"`
+	PeerID   string    `json:"peer_id"`
+	Username string    `json:"username"`
+	JoinedAt time.Time `json:"joined_at"`
+	Role     string    `json:"role"` // RoleAdmin or RoleMember
+	IsActive bool      `json:"is_active"`
 }
 
-// GroupInvite represents an invitation to join a group
+// MemberRef names a group member inside an invitation snapshot.
+type MemberRef struct {
+	PeerID   string `json:"peer_id"`
+	Username string `json:"username"`
+}
+
+// GroupInvite represents an invitation to join a group. The group details are
+// a snapshot taken by the inviter, so the invitee can create the group
+// locally when it accepts.
 type GroupInvite struct {
-	ID        string    `json:"id" db:"id"`
-	GroupID   string    `json:"group_id" db:"group_id"`
-	InviterID string    `json:"inviter_id" db:"inviter_id"`
-	InviteeID string    `json:"invitee_id" db:"invitee_id"`
-	CreatedAt time.Time `json:"created_at" db:"created_at"`
-	ExpiresAt time.Time `json:"expires_at" db:"expires_at"`
-	Status    string    `json:"status" db:"status"` // "pending", "accepted", "declined", "expired"
+	ID               string      `json:"id"`
+	GroupID          string      `json:"group_id"`
+	GroupName        string      `json:"group_name"`
+	GroupDescription string      `json:"group_description"`
+	GroupCreator     string      `json:"group_creator"`
+	InviterID        string      `json:"inviter_id"`
+	InviteeID        string      `json:"invitee_id"`
+	CreatedAt        time.Time   `json:"created_at"`
+	ExpiresAt        time.Time   `json:"expires_at"`
+	Status           string      `json:"status"`
+	Members          []MemberRef `json:"members"`
 }
 
 // NewGroup creates a new group
@@ -64,21 +97,11 @@ func NewGroupMember(groupID, peerID, username, role string) *GroupMember {
 	}
 }
 
-// NewGroupInvite creates a new group invitation
-func NewGroupInvite(id, groupID, inviterID, inviteeID string, expiresAt time.Time) *GroupInvite {
-	return &GroupInvite{
-		ID:        id,
-		GroupID:   groupID,
-		InviterID: inviterID,
-		InviteeID: inviteeID,
-		CreatedAt: time.Now(),
-		ExpiresAt: expiresAt,
-		Status:    "pending",
-	}
-}
-
 // AddMember adds a member to the group
 func (g *Group) AddMember(peerID, username string) {
+	if g.Members == nil {
+		g.Members = make(map[string]string)
+	}
 	g.Members[peerID] = username
 	g.UpdatedAt = time.Now()
 }
@@ -96,26 +119,7 @@ func (g *Group) HasMember(peerID string) bool {
 }
 
 // GetMemberCount returns the number of active members
-func (g *Group) GetMemberCount() int {
-	return len(g.Members)
-}
+func (g *Group) GetMemberCount() int { return len(g.Members) }
 
 // IsExpired checks if the invitation has expired
-func (gi *GroupInvite) IsExpired() bool {
-	return time.Now().After(gi.ExpiresAt)
-}
-
-// Accept marks the invitation as accepted
-func (gi *GroupInvite) Accept() {
-	gi.Status = "accepted"
-}
-
-// Decline marks the invitation as declined
-func (gi *GroupInvite) Decline() {
-	gi.Status = "declined"
-}
-
-// Expire marks the invitation as expired
-func (gi *GroupInvite) Expire() {
-	gi.Status = "expired"
-}
+func (gi *GroupInvite) IsExpired(now time.Time) bool { return now.After(gi.ExpiresAt) }

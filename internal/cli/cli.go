@@ -1,648 +1,1036 @@
+// Package cli is the interactive command-line interface.
 package cli
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
-	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
+	"text/tabwriter"
 	"time"
 
+	apperrors "github.com/samaasi/lazy-chat/internal/errors"
 	"github.com/samaasi/lazy-chat/internal/filetransfer"
+	"github.com/samaasi/lazy-chat/internal/identity"
 	"github.com/samaasi/lazy-chat/internal/interfaces"
 	"github.com/samaasi/lazy-chat/internal/messaging"
 	"github.com/samaasi/lazy-chat/internal/models"
 	"github.com/samaasi/lazy-chat/internal/services"
+	"github.com/samaasi/lazy-chat/internal/storage"
+	"github.com/samaasi/lazy-chat/internal/ui"
+	"github.com/samaasi/lazy-chat/internal/utils"
 )
+
+const (
+	// commandTimeout bounds commands that touch the network or database.
+	commandTimeout = 30 * time.Second
+	// maxInputLine is the longest input line accepted.
+	maxInputLine = 64 * 1024
+	defaultCount = 50
+	maxCount     = 500
+)
+
+// Deps are the collaborators of the CLI.
+type Deps struct {
+	In        io.Reader
+	Console   *ui.Console
+	SelfID    string
+	SelfName  string
+	Peers     interfaces.PeerManager
+	Net       interfaces.NetworkManager
+	Handler   *messaging.Handler
+	Groups    *services.GroupService
+	History   *services.MessageHistoryService
+	Files     *filetransfer.Manager
+	Verify    storage.VerificationStorage
+	Relay     RelayInfo
+	StartedAt time.Time
+	Version   string
+}
+
+// RelayInfo reports what this peer holds for others.
+type RelayInfo interface {
+	Enabled() bool
+	Usage(ctx context.Context) (envelopes int, bytes, capacity int64, err error)
+}
 
 // CLI handles command line interface interactions
 type CLI struct {
-	peerManager     interfaces.PeerManager
-	netManager      interfaces.NetworkManager
-	logger          interfaces.Logger
-	scanner         *bufio.Scanner
-	username        string
-	transferManager *filetransfer.TransferManager
-	groupService    *services.GroupService
-	messageHistory  *services.MessageHistoryService
-	messageHandler  interfaces.MessageHandler
+	Deps
+	commands []command
 }
 
-// New creates a new CLI instance
-func New(peerManager interfaces.PeerManager, netManager interfaces.NetworkManager, logger interfaces.Logger, username string, groupService *services.GroupService, messageHistory *services.MessageHistoryService, messageHandler interfaces.MessageHandler) *CLI {
-	// Create downloads directory
-	downloadDir := "downloads"
-	if err := os.MkdirAll(downloadDir, 0755); err != nil {
-		logger.Error("Failed to create downloads directory", "error", err)
-	}
-
-	return &CLI{
-		peerManager:     peerManager,
-		netManager:      netManager,
-		logger:          logger,
-		scanner:         bufio.NewScanner(os.Stdin),
-		username:        username,
-		transferManager: filetransfer.NewTransferManager(downloadDir, logger),
-		groupService:    groupService,
-		messageHistory:  messageHistory,
-		messageHandler:  messageHandler,
-	}
+type command struct {
+	names []string // first is canonical
+	usage string   // arguments, for help and usage errors
+	help  string
+	run   func(ctx context.Context, arg string) error
 }
 
-// Start begins the CLI interaction loop
+// errUsage makes the dispatcher print the command's usage line.
+var errUsage = errors.New("usage")
+
+// errQuit ends the session.
+var errQuit = errors.New("quit")
+
+// New creates a CLI.
+func New(d Deps) *CLI {
+	c := &CLI{Deps: d}
+	c.commands = c.buildCommands()
+	return c
+}
+
+// Start runs the read-eval loop until the input ends, the context is
+// cancelled or the user quits. It returns nil on a normal exit.
 func (c *CLI) Start(ctx context.Context) error {
 	c.printWelcome()
-	c.printHelp()
+
+	lines := make(chan string)
+	scanErr := make(chan error, 1)
+	go func() {
+		defer close(lines)
+		sc := bufio.NewScanner(c.In)
+		sc.Buffer(make([]byte, 0, 4096), maxInputLine)
+		for sc.Scan() {
+			select {
+			case lines <- sc.Text():
+			case <-ctx.Done():
+				return
+			}
+		}
+		scanErr <- sc.Err()
+	}()
 
 	for {
+		c.Console.ShowPrompt()
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-
-		fmt.Print("> ")
-		if !c.scanner.Scan() {
-			break
-		}
-
-		input := strings.TrimSpace(c.scanner.Text())
-		if input == "" {
-			continue
-		}
-
-		if err := c.handleCommand(ctx, input); err != nil {
-			if err.Error() == "exit" {
+			return nil
+		case line, ok := <-lines:
+			c.Console.InputDone()
+			if !ok {
+				select {
+				case err := <-scanErr:
+					if err != nil {
+						return fmt.Errorf("reading input: %w", err)
+					}
+				default:
+				}
 				return nil
 			}
-			fmt.Printf("Error: %v\n", err)
+			if err := c.execute(ctx, line); err != nil {
+				if errors.Is(err, errQuit) {
+					return nil
+				}
+				c.Console.Printf("Error: %v", err)
+			}
 		}
 	}
-
-	if err := c.scanner.Err(); err != nil {
-		return fmt.Errorf("scanner error: %w", err)
-	}
-
-	return nil
 }
 
-// handleCommand processes user commands
-func (c *CLI) handleCommand(ctx context.Context, input string) error {
-	parts := strings.Fields(input)
-	if len(parts) == 0 {
+// execute runs one input line.
+func (c *CLI) execute(ctx context.Context, line string) error {
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return nil
+	}
+	if !strings.HasPrefix(line, "/") {
+		c.Console.Printf("Messages are sent with /send <peer> <text>. Type /help for all commands.")
 		return nil
 	}
 
-	command := strings.ToLower(parts[0])
+	name, arg, _ := strings.Cut(line, " ")
+	name = strings.ToLower(name)
+	arg = strings.TrimSpace(arg)
 
-	switch command {
-	case "/help", "/h":
-		c.printHelp()
-
-	case "/list", "/l":
-		c.listPeers()
-
-	case "/connect", "/c":
-		if len(parts) < 2 {
-			fmt.Println("Usage: /connect <peer_id>")
+	for _, cmd := range c.commands {
+		if !slices.Contains(cmd.names, name) {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(ctx, commandTimeout)
+		err := cmd.run(ctx, arg)
+		cancel()
+		if errors.Is(err, errUsage) {
+			c.Console.Printf("Usage: %s %s", cmd.names[0], cmd.usage)
 			return nil
 		}
-		return c.connectToPeer(ctx, parts[1])
-
-	case "/send", "/s":
-		if len(parts) < 3 {
-			fmt.Println("Usage: /send <peer_id> <message>")
-			return nil
-		}
-		peerID := parts[1]
-		message := strings.Join(parts[2:], " ")
-		return c.sendMessage(peerID, message)
-
-	case "/connections", "/conn":
-		c.listConnections()
-
-	case "/status", "/st":
-		c.showStatus()
-
-	case "/sendfile", "/sf":
-		if len(parts) < 3 {
-			fmt.Println("Usage: /sendfile <peer_id> <file_path>")
-			return nil
-		}
-		return c.sendFile(ctx, parts[1], parts[2])
-
-	case "/transfers", "/tf":
-		c.showTransfers()
-
-	// Group commands
-	case "/creategroup", "/cg":
-		if len(parts) < 2 {
-			fmt.Println("Usage: /creategroup <name> [description]")
-			return nil
-		}
-		name := parts[1]
-		description := ""
-		if len(parts) > 2 {
-			description = strings.Join(parts[2:], " ")
-		}
-		return c.createGroup(name, description)
-
-	case "/joingroup", "/jg":
-		if len(parts) < 2 {
-			fmt.Println("Usage: /joingroup <group_id>")
-			return nil
-		}
-		return c.joinGroup(parts[1])
-
-	case "/leavegroup", "/lg":
-		if len(parts) < 2 {
-			fmt.Println("Usage: /leavegroup <group_id>")
-			return nil
-		}
-		return c.leaveGroup(parts[1])
-
-	case "/groups", "/g":
-		c.listGroups()
-
-	case "/groupmsg", "/gm":
-		if len(parts) < 3 {
-			fmt.Println("Usage: /groupmsg <group_id> <message>")
-			return nil
-		}
-		groupID := parts[1]
-		message := strings.Join(parts[2:], " ")
-		return c.sendGroupMessage(groupID, message)
-
-	case "/invite", "/inv":
-		if len(parts) < 3 {
-			fmt.Println("Usage: /invite <group_id> <peer_id>")
-			return nil
-		}
-		return c.inviteToGroup(parts[1], parts[2])
-
-	case "/invites", "/invs":
-		c.showPendingInvites()
-
-	case "/accept", "/acc":
-		if len(parts) < 2 {
-			fmt.Println("Usage: /accept <group_id>")
-			return nil
-		}
-		return c.acceptInvite(parts[1])
-
-	case "/decline", "/dec":
-		if len(parts) < 2 {
-			fmt.Println("Usage: /decline <group_id>")
-			return nil
-		}
-		return c.declineInvite(parts[1])
-
-	// Message history commands
-	case "/history", "/hist":
-		if len(parts) < 2 {
-			fmt.Println("Usage: /history <peer_id>")
-			return nil
-		}
-		c.showMessageHistory(parts[1])
-
-	case "/grouphistory", "/gh":
-		if len(parts) < 2 {
-			fmt.Println("Usage: /grouphistory <group_id>")
-			return nil
-		}
-		c.showGroupHistory(parts[1])
-
-	case "/recent", "/r":
-		c.showRecentMessages()
-
-	case "/exit", "/quit", "/q":
-		fmt.Println("Goodbye!")
-		return fmt.Errorf("exit")
-
-	default:
-		fmt.Printf("Unknown command: %s. Type /help for available commands.\n", command)
-	}
-
-	return nil
-}
-
-// printWelcome displays the welcome message
-func (c *CLI) printWelcome() {
-	fmt.Println("========================================")
-	fmt.Println("    Welcome to P2P Chat Application    ")
-	fmt.Printf("         Username: %s\n", c.username)
-	fmt.Println("========================================")
-	fmt.Println()
-}
-
-// printHelp displays available commands
-func (c *CLI) printHelp() {
-	fmt.Println("Available commands:")
-	fmt.Println("  /help, /h              - Show this help message")
-	fmt.Println("  /list, /l              - List discovered peers")
-	fmt.Println("  /connect, /c <id>      - Connect to a peer by ID")
-	fmt.Println("  /send, /s <id> <msg>   - Send message to connected peer")
-	fmt.Println("  /sendfile, /sf <id> <path> - Send file to connected peer")
-	fmt.Println("  /transfers, /tf        - Show active file transfers")
-	fmt.Println("  /connections, /conn    - List active connections")
-	fmt.Println("  /status, /st           - Show application status")
-	fmt.Println("")
-	fmt.Println("Group commands:")
-	fmt.Println("  /creategroup, /cg <name> [description] - Create a new group")
-	fmt.Println("  /joingroup, /jg <group_id>             - Join a group")
-	fmt.Println("  /leavegroup, /lg <group_id>            - Leave a group")
-	fmt.Println("  /groups, /g                            - List your groups")
-	fmt.Println("  /groupmsg, /gm <group_id> <message>    - Send group message")
-	fmt.Println("  /invite, /inv <group_id> <peer_id>     - Invite peer to group")
-	fmt.Println("  /invites, /invs                        - Show pending invites")
-	fmt.Println("  /accept, /acc <group_id>               - Accept group invite")
-	fmt.Println("  /decline, /dec <group_id>              - Decline group invite")
-	fmt.Println("")
-	fmt.Println("Message history:")
-	fmt.Println("  /history, /hist <peer_id>              - Show message history")
-	fmt.Println("  /grouphistory, /gh <group_id>          - Show group message history")
-	fmt.Println("  /recent, /r                            - Show recent messages")
-	fmt.Println("")
-	fmt.Println("  /exit, /quit, /q       - Exit the application")
-	fmt.Println()
-}
-
-// listPeers displays all discovered peers
-func (c *CLI) listPeers() {
-	peers := c.peerManager.GetAllPeers()
-
-	if len(peers) == 0 {
-		fmt.Println("No peers discovered yet.")
-		return
-	}
-
-	fmt.Printf("Discovered peers (%d):\n", len(peers))
-	fmt.Println("ID\t\tUsername\t\tAddress\t\t\tLast Seen")
-	fmt.Println("--\t\t--------\t\t-------\t\t\t---------")
-
-	for _, peer := range peers {
-		lastSeen := time.Since(peer.LastSeen).Truncate(time.Second)
-		connected := ""
-		if c.netManager.IsConnected(peer.ID) {
-			connected = " [CONNECTED]"
-		}
-		fmt.Printf("%s\t%s\t\t%s\t\t%s ago%s\n",
-			peer.ID, peer.Username, peer.NetworkAddress(), lastSeen, connected)
-	}
-	fmt.Println()
-}
-
-// connectToPeer establishes a connection to a peer
-func (c *CLI) connectToPeer(ctx context.Context, peerID string) error {
-	if c.netManager.IsConnected(peerID) {
-		fmt.Printf("Already connected to peer %s\n", peerID)
-		return nil
-	}
-
-	peer, exists := c.peerManager.GetPeer(peerID)
-	if !exists {
-		fmt.Printf("Peer %s not found. Use /list to see available peers.\n", peerID)
-		return nil
-	}
-
-	fmt.Printf("Connecting to %s (%s)...\n", peer.Username, peer.NetworkAddress())
-
-	if err := c.netManager.ConnectToPeer(ctx, peerID); err != nil {
-		return fmt.Errorf("failed to connect to peer %s: %w", peerID, err)
-	}
-
-	fmt.Printf("Successfully connected to %s!\n", peer.Username)
-	return nil
-}
-
-// sendMessage sends a message to a connected peer
-func (c *CLI) sendMessage(peerID, message string) error {
-	if !c.netManager.IsConnected(peerID) {
-		fmt.Printf("Not connected to peer %s. Use /connect %s first.\n", peerID, peerID)
-		return nil
-	}
-
-	peer, exists := c.peerManager.GetPeer(peerID)
-	if !exists {
-		fmt.Printf("Peer %s not found.\n", peerID)
-		return nil
-	}
-
-	if err := c.netManager.SendMessage(peerID, message); err != nil {
-		return fmt.Errorf("failed to send message to %s: %w", peer.Username, err)
-	}
-
-	fmt.Printf("Message sent to %s\n", peer.Username)
-	return nil
-}
-
-// listConnections displays all active connections
-func (c *CLI) listConnections() {
-	connections := c.netManager.GetConnections()
-
-	if len(connections) == 0 {
-		fmt.Println("No active connections.")
-		return
-	}
-
-	fmt.Printf("Active connections (%d):\n", len(connections))
-	fmt.Println("Peer ID\t\tUsername\t\tAddress")
-	fmt.Println("-------\t\t--------\t\t-------")
-
-	for peerID := range connections {
-		if peer, exists := c.peerManager.GetPeer(peerID); exists {
-			fmt.Printf("%s\t%s\t\t%s\n", peerID, peer.Username, peer.NetworkAddress())
-		} else {
-			fmt.Printf("%s\t<unknown>\t\t<unknown>\n", peerID)
-		}
-	}
-	fmt.Println()
-}
-
-// showStatus displays application status
-func (c *CLI) showStatus() {
-	peers := c.peerManager.GetAllPeers()
-	connections := c.netManager.GetConnections()
-
-	fmt.Println("Application Status:")
-	fmt.Printf("  Username: %s\n", c.username)
-	fmt.Printf("  Discovered peers: %d\n", len(peers))
-	fmt.Printf("  Active connections: %d\n", len(connections))
-	fmt.Printf("  Uptime: %s\n", "N/A") // Could track this if needed
-	fmt.Println()
-}
-
-// sendFile sends a file to a connected peer
-func (c *CLI) sendFile(ctx context.Context, peerID, filePath string) error {
-	if !c.netManager.IsConnected(peerID) {
-		fmt.Printf("Not connected to peer %s. Use /connect %s first.\n", peerID, peerID)
-		return nil
-	}
-
-	// Check if file exists
-	if _, err := os.Stat(filePath); os.IsNotExist(err) {
-		fmt.Printf("File not found: %s\n", filePath)
-		return nil
-	}
-
-	peer, exists := c.peerManager.GetPeer(peerID)
-	if !exists {
-		fmt.Printf("Peer %s not found.\n", peerID)
-		return nil
-	}
-
-	fmt.Printf("Sending file %s to %s...\n", filepath.Base(filePath), peer.Username)
-
-	if err := c.transferManager.SendFile(ctx, peerID, filePath); err != nil {
-		return fmt.Errorf("failed to send file to %s: %w", peer.Username, err)
-	}
-
-	fmt.Printf("File transfer initiated to %s\n", peer.Username)
-	return nil
-}
-
-// showTransfers displays active file transfers
-func (c *CLI) showTransfers() {
-	transfers := c.transferManager.GetActiveTransfers()
-
-	if len(transfers) == 0 {
-		fmt.Println("No active file transfers.")
-		return
-	}
-
-	fmt.Printf("Active file transfers (%d):\n", len(transfers))
-	fmt.Println("Transfer ID\t\tFile\t\t\tPeer\t\tStatus\t\tProgress")
-	fmt.Println("-----------\t\t----\t\t\t----\t\t------\t\t--------")
-
-	for _, transfer := range transfers {
-		peer, exists := c.peerManager.GetPeer(transfer.PeerID)
-		peerName := transfer.PeerID
-		if exists {
-			peerName = peer.Username
-		}
-
-		progress := "0%"
-		if transfer.FileSize > 0 {
-			pct := float64(transfer.BytesTransferred) / float64(transfer.FileSize) * 100
-			progress = fmt.Sprintf("%.1f%%", pct)
-		}
-
-		fmt.Printf("%s\t%s\t\t%s\t\t%s\t\t%s\n",
-			transfer.TransferID[:8], // Show first 8 chars of transfer ID
-			filepath.Base(transfer.FileName),
-			peerName,
-			transfer.Status,
-			progress)
-	}
-	fmt.Println()
-}
-
-// Group command handlers
-func (c *CLI) createGroup(name, description string) error {
-	group, err := c.groupService.CreateGroup(name, description)
-	if err != nil {
-		fmt.Printf("Failed to create group: %v\n", err)
 		return err
 	}
-	fmt.Printf("Group created successfully! ID: %s\n", group.ID)
+	c.Console.Printf("Unknown command: %s. Type /help for available commands.", name)
 	return nil
 }
 
-func (c *CLI) joinGroup(groupID string) error {
-	err := c.groupService.JoinGroup(groupID, c.username)
-	if err != nil {
-		fmt.Printf("Failed to join group: %v\n", err)
-		return err
-	}
-	fmt.Printf("Successfully joined group %s\n", groupID)
-	return nil
-}
-
-func (c *CLI) leaveGroup(groupID string) error {
-	err := c.groupService.LeaveGroup(groupID, c.username)
-	if err != nil {
-		fmt.Printf("Failed to leave group: %v\n", err)
-		return err
-	}
-	fmt.Printf("Successfully left group %s\n", groupID)
-	return nil
-}
-
-func (c *CLI) listGroups() {
-	groups, err := c.groupService.GetUserGroups(c.username)
-	if err != nil {
-		fmt.Printf("Failed to get groups: %v\n", err)
-		return
-	}
-
-	if len(groups) == 0 {
-		fmt.Println("You are not a member of any groups")
-		return
-	}
-
-	fmt.Println("Your groups:")
-	for _, group := range groups {
-		fmt.Printf("  %s: %s\n", group.ID, group.Name)
-		if group.Description != "" {
-			fmt.Printf("    Description: %s\n", group.Description)
-		}
-		fmt.Printf("    Created: %s\n", group.CreatedAt.Format("2006-01-02 15:04:05"))
-	}
-}
-
-func (c *CLI) sendGroupMessage(groupID, message string) error {
-	// Use network manager to send group message
-	// First get group members
-	groups, err := c.groupService.GetUserGroups(c.username)
-	if err != nil {
-		fmt.Printf("Failed to get groups: %v\n", err)
-		return err
-	}
-
-	// Find the target group
-	var targetGroup *models.Group
-	for _, group := range groups {
-		if group.ID == groupID {
-			targetGroup = group
+// splitN splits s into at most n parts on whitespace; the last part keeps the
+// rest of the string verbatim (so message text is not reformatted).
+func splitN(s string, n int) []string {
+	var parts []string
+	s = strings.TrimSpace(s)
+	for len(parts) < n-1 {
+		i := strings.IndexAny(s, " \t")
+		if i < 0 {
 			break
 		}
+		parts = append(parts, s[:i])
+		s = strings.TrimLeft(s[i:], " \t")
+	}
+	if s != "" {
+		parts = append(parts, s)
+	}
+	return parts
+}
+
+func parseCount(s string) (int, error) {
+	if s == "" {
+		return defaultCount, nil
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 1 {
+		return 0, fmt.Errorf("%q is not a positive number", s)
+	}
+	return min(n, maxCount), nil
+}
+
+// ---- Command table -----------------------------------------------------------
+
+func (c *CLI) buildCommands() []command {
+	return []command{
+		{[]string{"/help", "/h"}, "", "Show this help", func(context.Context, string) error { c.printHelp(); return nil }},
+		{[]string{"/whoami", "/me"}, "", "Show your name and peer ID", c.cmdWhoami},
+		{[]string{"/list", "/l"}, "", "List discovered peers", c.cmdList},
+		{[]string{"/safety"}, "<peer>", "Show the safety number to compare with a peer", c.cmdSafety},
+		{[]string{"/verify"}, "<peer>", "Mark a peer as verified after comparing safety numbers", c.cmdVerify},
+		{[]string{"/unverify"}, "<peer>", "Remove a peer's verified mark", c.cmdUnverify},
+		{[]string{"/connect", "/c"}, "<peer>", "Connect to a peer", c.cmdConnect},
+		{[]string{"/disconnect"}, "<peer>", "Close the connection to a peer", c.cmdDisconnect},
+		{[]string{"/connections", "/conn"}, "", "List active connections", c.cmdConnections},
+		{[]string{"/send", "/s"}, "<peer> <message>", "Send a message", c.cmdSend},
+		{[]string{"/sendfile", "/sf"}, "<peer> <path>", "Offer a file to a peer", c.cmdSendFile},
+		{[]string{"/transfers", "/tf"}, "", "Show file transfers", c.cmdTransfers},
+		{[]string{"/getfile"}, "<transfer>", "Accept an incoming file", c.cmdGetFile},
+		{[]string{"/rejectfile"}, "<transfer>", "Decline an incoming file", c.cmdRejectFile},
+		{[]string{"/cancel"}, "<transfer>", "Cancel a transfer", c.cmdCancel},
+		{[]string{"/creategroup", "/cg"}, "<name> [| description]", "Create a group", c.cmdCreateGroup},
+		{[]string{"/groups", "/g"}, "", "List your groups", c.cmdGroups},
+		{[]string{"/members"}, "<group>", "List a group's members", c.cmdMembers},
+		{[]string{"/groupmsg", "/gm"}, "<group> <message>", "Send a message to a group", c.cmdGroupMsg},
+		{[]string{"/invite", "/inv"}, "<group> <peer>", "Invite a peer (group creator only)", c.cmdInvite},
+		{[]string{"/invites", "/invs"}, "", "Show pending invitations", c.cmdInvites},
+		{[]string{"/accept", "/acc"}, "<group>", "Accept an invitation", c.cmdAccept},
+		{[]string{"/decline", "/dec"}, "<group>", "Decline an invitation", c.cmdDecline},
+		{[]string{"/leavegroup", "/lg"}, "<group>", "Leave a group", c.cmdLeave},
+		{[]string{"/kick"}, "<group> <peer>", "Remove a member (group creator only)", c.cmdKick},
+		{[]string{"/history", "/hist"}, "<peer> [count]", "Show a conversation", c.cmdHistory},
+		{[]string{"/grouphistory", "/gh"}, "<group> [count]", "Show a group's messages", c.cmdGroupHistory},
+		{[]string{"/recent", "/r"}, "[count]", "Show the newest messages", c.cmdRecent},
+		{[]string{"/search"}, "<text>", "Search message history", c.cmdSearch},
+		{[]string{"/export"}, "<peer|group> <file> [text|json]", "Export a conversation to a new file", c.cmdExport},
+		{[]string{"/relay"}, "", "Show messages held for offline peers", c.cmdRelay},
+		{[]string{"/status", "/st"}, "", "Show application status", c.cmdStatus},
+		{[]string{"/quit", "/exit", "/q"}, "", "Exit", func(context.Context, string) error {
+			c.Console.Printf("Goodbye!")
+			return errQuit
+		}},
+	}
+}
+
+func (c *CLI) printWelcome() {
+	c.Console.Printf("========================================")
+	c.Console.Printf("  Lazy Chat %s", c.Version)
+	c.Console.Printf("  You are %s", c.SelfName)
+	c.Console.Printf("  Peer ID %s", c.SelfID)
+	c.Console.Printf("========================================")
+	c.Console.Printf("Type /help for commands.")
+}
+
+func (c *CLI) printHelp() {
+	var b bytes.Buffer
+	w := tabwriter.NewWriter(&b, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(w, "Commands:")
+	for _, cmd := range c.commands {
+		alias := ""
+		if len(cmd.names) > 1 {
+			alias = " (" + strings.Join(cmd.names[1:], ", ") + ")"
+		}
+		fmt.Fprintf(w, "  %s %s\t%s%s\n", cmd.names[0], cmd.usage, cmd.help, alias)
+	}
+	w.Flush()
+	c.Console.Printf("%s", strings.TrimRight(b.String(), "\n"))
+	c.Console.Printf("")
+	c.Console.Printf("<peer> is a peer ID, a unique ID prefix (4+ characters) or a name; <group> is a group ID, prefix or name.")
+}
+
+// ---- Resolving arguments -------------------------------------------------
+
+// resolvePeer turns user input into a peer ID. A full ID is accepted even if
+// the peer is not currently known (history of offline peers, for instance).
+func (c *CLI) resolvePeer(query string) (string, error) {
+	query = strings.ToLower(strings.TrimSpace(query))
+	if identity.ValidID(query) {
+		return query, nil
+	}
+	if p, err := c.Peers.ResolvePeer(query); err == nil {
+		return p.ID, nil
+	} else if !errors.Is(err, apperrors.ErrPeerNotFound) {
+		return "", err // e.g. an ambiguous query
 	}
 
-	if targetGroup == nil {
-		fmt.Printf("Group %s not found\n", groupID)
-		return fmt.Errorf("group not found")
+	// Peers that connected to us without ever being discovered.
+	var match []string
+	for _, id := range c.Net.ConnectedPeers() {
+		name, _ := c.Net.PeerName(id)
+		if (len(query) >= 4 && strings.HasPrefix(id, query)) || strings.EqualFold(name, query) {
+			match = append(match, id)
+		}
 	}
+	switch len(match) {
+	case 1:
+		return match[0], nil
+	case 0:
+		return "", fmt.Errorf("no peer matches %q (see /list)", query)
+	default:
+		return "", fmt.Errorf("%q matches %d peers; use a longer ID prefix", query, len(match))
+	}
+}
 
-	// Send the message through the message handler
-	if handler, ok := c.messageHandler.(*messaging.Handler); ok {
-		err = handler.SendGroupMessage(groupID, message)
-		if err != nil {
-			fmt.Printf("Failed to send group message: %v\n", err)
+func (c *CLI) resolveGroup(ctx context.Context, query string) (*models.Group, error) {
+	groups, err := c.Groups.GetUserGroups(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return pickGroup(query, groups, func(g *models.Group) (string, string) { return g.ID, g.Name })
+}
+
+func pickGroup[T any](query string, items []T, idName func(T) (id, name string)) (T, error) {
+	var zero T
+	query = strings.TrimSpace(query)
+	lower := strings.ToLower(query)
+
+	var byID, byName []T
+	for _, it := range items {
+		id, name := idName(it)
+		switch {
+		case strings.EqualFold(id, query):
+			return it, nil
+		case len(lower) >= 4 && strings.HasPrefix(strings.ToLower(id), lower):
+			byID = append(byID, it)
+		}
+		if strings.EqualFold(name, query) {
+			byName = append(byName, it)
+		}
+	}
+	for _, set := range [][]T{byID, byName} {
+		switch len(set) {
+		case 0:
+			continue
+		case 1:
+			return set[0], nil
+		default:
+			return zero, fmt.Errorf("%q matches several groups; use the group ID", query)
+		}
+	}
+	return zero, fmt.Errorf("no group matches %q (see /groups)", query)
+}
+
+func (c *CLI) name(peerID string) string { return c.Handler.DisplayName(peerID) }
+
+func clean(s string, max int) string { return utils.SanitizeText(s, max) }
+
+// ---- Peers and connections -----------------------------------------------
+
+func (c *CLI) verifiedSet(ctx context.Context) map[string]time.Time {
+	if c.Verify == nil {
+		return nil
+	}
+	set, err := c.Verify.ListVerified(ctx)
+	if err != nil {
+		return nil
+	}
+	return set
+}
+
+func (c *CLI) trust(verified map[string]time.Time, id string) string {
+	if _, ok := verified[id]; ok {
+		return "verified"
+	}
+	return "unverified"
+}
+
+// ---- Safety numbers -------------------------------------------------------
+
+func (c *CLI) cmdSafety(ctx context.Context, arg string) error {
+	if arg == "" {
+		return errUsage
+	}
+	id, err := c.resolvePeer(arg)
+	if err != nil {
+		return err
+	}
+	groups := strings.Fields(identity.SafetyNumber(c.SelfID, id))
+	status := "NOT verified"
+	if c.Verify != nil {
+		if ok, _ := c.Verify.IsVerified(ctx, id); ok {
+			status = "verified"
+		}
+	}
+	c.Console.Printf("Safety number with %s (%s):", c.name(id), status)
+	c.Console.Printf("")
+	c.Console.Printf("    %s", strings.Join(groups[:6], "  "))
+	c.Console.Printf("    %s", strings.Join(groups[6:], "  "))
+	c.Console.Printf("")
+	c.Console.Printf("Both of you should see exactly this number. Compare it in person or over a")
+	c.Console.Printf("call you trust (not in this chat). If it matches, run: /verify %s", id[:8])
+	c.Console.Printf("If it differs, someone is impersonating one of you - do not trust this peer.")
+	return nil
+}
+
+func (c *CLI) cmdVerify(ctx context.Context, arg string) error {
+	return c.setVerified(ctx, arg, true)
+}
+
+func (c *CLI) cmdUnverify(ctx context.Context, arg string) error {
+	return c.setVerified(ctx, arg, false)
+}
+
+func (c *CLI) setVerified(ctx context.Context, arg string, verified bool) error {
+	if arg == "" {
+		return errUsage
+	}
+	if c.Verify == nil {
+		return errors.New("verification is not available")
+	}
+	id, err := c.resolvePeer(arg)
+	if err != nil {
+		return err
+	}
+	if err := c.Verify.SetVerified(ctx, id, verified); err != nil {
+		return err
+	}
+	if verified {
+		c.Console.Printf("%s is now marked verified. Only do this after comparing the safety number (/safety).", c.name(id))
+	} else {
+		c.Console.Printf("%s is no longer marked verified.", c.name(id))
+	}
+	return nil
+}
+
+func (c *CLI) cmdWhoami(context.Context, string) error {
+	c.Console.Printf("Name:    %s", c.SelfName)
+	c.Console.Printf("Peer ID: %s", c.SelfID)
+	c.Console.Printf("Share your peer ID so others can invite you to groups.")
+	return nil
+}
+
+func (c *CLI) table(header string, rows [][]string) {
+	var b bytes.Buffer
+	w := tabwriter.NewWriter(&b, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(w, header)
+	for _, r := range rows {
+		fmt.Fprintln(w, strings.Join(r, "\t"))
+	}
+	w.Flush()
+	c.Console.Printf("%s", strings.TrimRight(b.String(), "\n"))
+}
+
+func (c *CLI) cmdList(ctx context.Context, _ string) error {
+	verified := c.verifiedSet(ctx)
+	peers := c.Peers.Peers()
+	if len(peers) == 0 {
+		c.Console.Printf("No peers discovered yet.")
+		return nil
+	}
+	rows := make([][]string, 0, len(peers))
+	for _, p := range peers {
+		state := ""
+		if c.Net.IsConnected(p.ID) {
+			state = "connected"
+		}
+		rows = append(rows, []string{clean(p.Username, 32), p.ID[:8], p.NetworkAddress(),
+			time.Since(p.LastSeen).Truncate(time.Second).String() + " ago", state, c.trust(verified, p.ID)})
+	}
+	c.Console.Printf("Discovered peers (%d):", len(peers))
+	c.table("NAME\tID\tADDRESS\tLAST SEEN\tSTATE\tTRUST", rows)
+	return nil
+}
+
+func (c *CLI) cmdConnect(ctx context.Context, arg string) error {
+	if arg == "" {
+		return errUsage
+	}
+	id, err := c.resolvePeer(arg)
+	if err != nil {
+		return err
+	}
+	if c.Net.IsConnected(id) {
+		c.Console.Printf("Already connected to %s", c.name(id))
+		return nil
+	}
+	c.Console.Printf("Connecting to %s...", c.name(id))
+	if err := c.Net.ConnectToPeer(ctx, id); err != nil {
+		return fmt.Errorf("could not connect: %w", err)
+	}
+	return nil // the connection event announces success
+}
+
+func (c *CLI) cmdDisconnect(_ context.Context, arg string) error {
+	if arg == "" {
+		return errUsage
+	}
+	id, err := c.resolvePeer(arg)
+	if err != nil {
+		return err
+	}
+	if !c.Net.IsConnected(id) {
+		c.Console.Printf("Not connected to %s", c.name(id))
+		return nil
+	}
+	c.Net.Disconnect(id)
+	return nil
+}
+
+func (c *CLI) cmdConnections(ctx context.Context, _ string) error {
+	verified := c.verifiedSet(ctx)
+	ids := c.Net.ConnectedPeers()
+	if len(ids) == 0 {
+		c.Console.Printf("No active connections.")
+		return nil
+	}
+	rows := make([][]string, 0, len(ids))
+	for _, id := range ids {
+		name, _ := c.Net.PeerName(id)
+		addr := "-"
+		if p, ok := c.Peers.GetPeer(id); ok {
+			addr = p.NetworkAddress()
+		}
+		rows = append(rows, []string{clean(name, 32), id[:8], addr, c.trust(verified, id)})
+	}
+	c.Console.Printf("Active connections (%d), all encrypted and authenticated:", len(ids))
+	c.table("NAME\tID\tADDRESS\tTRUST", rows)
+	return nil
+}
+
+func (c *CLI) cmdRelay(ctx context.Context, _ string) error {
+	if c.Relay == nil {
+		c.Console.Printf("Offline delivery is not available.")
+		return nil
+	}
+	n, used, capacity, err := c.Relay.Usage(ctx)
+	if err != nil {
+		return err
+	}
+	if c.Relay.Enabled() {
+		c.Console.Printf("Relaying is ON: holding %d encrypted message(s) for others (%s of %s).", n, ui.FormatBytes(used), ui.FormatBytes(capacity))
+		c.Console.Printf("You can see who they are from and for, but never what they say.")
+	} else {
+		c.Console.Printf("Relaying is OFF: you do not hold messages for others (start with --relay to turn it on).")
+		c.Console.Printf("You can still send to offline peers through other peers' relays.")
+	}
+	return nil
+}
+
+func (c *CLI) cmdStatus(context.Context, string) error {
+	c.Console.Printf("Name:                %s", c.SelfName)
+	c.Console.Printf("Peer ID:             %s", c.SelfID)
+	c.Console.Printf("Discovered peers:    %d", len(c.Peers.Peers()))
+	c.Console.Printf("Active connections:  %d", len(c.Net.ConnectedPeers()))
+	c.Console.Printf("Open transfers:      %d", len(c.Files.GetActiveTransfers()))
+	c.Console.Printf("Uptime:              %s", time.Since(c.StartedAt).Truncate(time.Second))
+	return nil
+}
+
+// ---- Messaging -----------------------------------------------------------
+
+func (c *CLI) cmdSend(ctx context.Context, arg string) error {
+	parts := splitN(arg, 2)
+	if len(parts) < 2 {
+		return errUsage
+	}
+	id, err := c.resolvePeer(parts[0])
+	if err != nil {
+		return err
+	}
+	err = c.Handler.SendMessage(ctx, id, parts[1])
+	note, warn := "", ""
+	switch {
+	case messaging.IsQueued(err):
+		note = "  (offline: queued with relays, delivered when they return)"
+		var q *messaging.QueuedError
+		if errors.As(err, &q) && q.Exposed > 0 {
+			warn = fmt.Sprintf("  ! %d relay(s) could see that this is from you: too few peers are connected to hide it", q.Exposed)
+		}
+	case err != nil:
+		return err
+	}
+	c.Console.Printf("[%s] you -> %s: %s%s", time.Now().Format("15:04:05"), c.name(id), clean(parts[1], 0), note)
+	if warn != "" {
+		c.Console.Printf("%s", warn)
+	}
+	return nil
+}
+
+func (c *CLI) cmdGroupMsg(ctx context.Context, arg string) error {
+	parts := splitN(arg, 2)
+	if len(parts) < 2 {
+		return errUsage
+	}
+	g, err := c.resolveGroup(ctx, parts[0])
+	if err != nil {
+		return err
+	}
+	res, err := c.Handler.SendGroupMessage(ctx, g.ID, parts[1])
+	if err != nil {
+		return err
+	}
+	c.Console.Printf("[%s] you -> [%s]: %s", time.Now().Format("15:04:05"), clean(g.Name, models.MaxGroupNameLen), clean(parts[1], 0))
+	for _, peerID := range res.Relayed {
+		c.Console.Printf("  %s is offline: queued with relays, delivered when they return", c.name(peerID))
+	}
+	for peerID, ferr := range res.Failed {
+		c.Console.Printf("  not delivered to %s: %v", c.name(peerID), ferr)
+	}
+	return nil
+}
+
+// ---- Files ---------------------------------------------------------------
+
+func (c *CLI) cmdSendFile(ctx context.Context, arg string) error {
+	parts := splitN(arg, 2)
+	if len(parts) < 2 {
+		return errUsage
+	}
+	id, err := c.resolvePeer(parts[0])
+	if err != nil {
+		return err
+	}
+	path := strings.Trim(parts[1], `"'`)
+	tid, err := c.Files.SendFile(ctx, id, path)
+	if err != nil {
+		return err
+	}
+	c.Console.Printf("Preparing %s for %s (transfer %s)...", clean(path, 120), c.name(id), tid[:8])
+	return nil
+}
+
+func (c *CLI) cmdTransfers(context.Context, string) error {
+	list := c.Files.List()
+	if len(list) == 0 {
+		c.Console.Printf("No file transfers.")
+		return nil
+	}
+	rows := make([][]string, 0, len(list))
+	for _, t := range list {
+		dir := "<-"
+		if t.Direction == filetransfer.Sending {
+			dir = "->"
+		}
+		progress := "-"
+		if t.FileSize > 0 {
+			progress = fmt.Sprintf("%.0f%%", float64(t.BytesTransferred)/float64(t.FileSize)*100)
+		}
+		status := string(t.Status)
+		if t.Reason != "" {
+			status += " (" + clean(t.Reason, 60) + ")"
+		}
+		rows = append(rows, []string{t.TransferID[:8], dir, c.name(t.PeerID), clean(t.FileName, 60), ui.FormatBytes(t.FileSize), progress, status})
+	}
+	c.table("ID\t\tPEER\tFILE\tSIZE\tDONE\tSTATUS", rows)
+	return nil
+}
+
+func (c *CLI) cmdGetFile(_ context.Context, arg string) error {
+	if arg == "" {
+		return errUsage
+	}
+	st, err := c.Files.Accept(arg)
+	if err != nil {
+		return err
+	}
+	c.Console.Printf("Accepted %q from %s; receiving into the download directory.", clean(st.FileName, 80), c.name(st.PeerID))
+	return nil
+}
+
+func (c *CLI) cmdRejectFile(_ context.Context, arg string) error {
+	if arg == "" {
+		return errUsage
+	}
+	st, err := c.Files.Reject(arg)
+	if err != nil {
+		return err
+	}
+	c.Console.Printf("Declined %q from %s.", clean(st.FileName, 80), c.name(st.PeerID))
+	return nil
+}
+
+func (c *CLI) cmdCancel(_ context.Context, arg string) error {
+	if arg == "" {
+		return errUsage
+	}
+	st, err := c.Files.Cancel(arg)
+	if err != nil {
+		return err
+	}
+	c.Console.Printf("Cancelled transfer of %q.", clean(st.FileName, 80))
+	return nil
+}
+
+// ---- Groups --------------------------------------------------------------
+
+func (c *CLI) cmdCreateGroup(ctx context.Context, arg string) error {
+	if arg == "" {
+		return errUsage
+	}
+	name, desc, _ := strings.Cut(arg, "|")
+	g, err := c.Groups.CreateGroup(ctx, strings.TrimSpace(name), strings.TrimSpace(desc))
+	if err != nil {
+		return err
+	}
+	c.Console.Printf("Created group %q. ID: %s", g.Name, g.ID)
+	c.Console.Printf("Invite people with: /invite %s <peer>", g.ID[:12])
+	return nil
+}
+
+func (c *CLI) cmdGroups(ctx context.Context, _ string) error {
+	groups, err := c.Groups.GetUserGroups(ctx)
+	if err != nil {
+		return err
+	}
+	if len(groups) == 0 {
+		c.Console.Printf("You are not a member of any groups.")
+		return nil
+	}
+	rows := make([][]string, 0, len(groups))
+	for _, g := range groups {
+		role := "member"
+		if g.CreatedBy == c.SelfID {
+			role = "creator"
+		}
+		rows = append(rows, []string{clean(g.Name, models.MaxGroupNameLen), g.ID, role, clean(g.Description, 60)})
+	}
+	c.table("NAME\tID\tROLE\tDESCRIPTION", rows)
+	return nil
+}
+
+func (c *CLI) cmdMembers(ctx context.Context, arg string) error {
+	if arg == "" {
+		return errUsage
+	}
+	g, err := c.resolveGroup(ctx, arg)
+	if err != nil {
+		return err
+	}
+	members, err := c.Groups.GetGroupMembers(ctx, g.ID)
+	if err != nil {
+		return err
+	}
+	rows := make([][]string, 0, len(members))
+	for _, m := range members {
+		state := ""
+		switch {
+		case m.PeerID == c.SelfID:
+			state = "you"
+		case c.Net.IsConnected(m.PeerID):
+			state = "connected"
+		}
+		rows = append(rows, []string{clean(m.Username, 32), m.PeerID[:8], m.Role, state})
+	}
+	c.Console.Printf("Members of %s (%d):", clean(g.Name, models.MaxGroupNameLen), len(members))
+	c.table("NAME\tID\tROLE\t", rows)
+	return nil
+}
+
+func (c *CLI) cmdInvite(ctx context.Context, arg string) error {
+	parts := splitN(arg, 2)
+	if len(parts) != 2 {
+		return errUsage
+	}
+	g, err := c.resolveGroup(ctx, parts[0])
+	if err != nil {
+		return err
+	}
+	peerID, err := c.resolvePeer(parts[1])
+	if err != nil {
+		return err
+	}
+	if err := c.Handler.InviteToGroup(ctx, g.ID, peerID); err != nil {
+		return err
+	}
+	c.Console.Printf("Invited %s to %q (valid for %s).", c.name(peerID), clean(g.Name, models.MaxGroupNameLen), messaging.InviteTTL)
+	return nil
+}
+
+func (c *CLI) cmdInvites(ctx context.Context, _ string) error {
+	invites, err := c.Groups.GetPendingInvites(ctx)
+	if err != nil {
+		return err
+	}
+	if len(invites) == 0 {
+		c.Console.Printf("No pending invitations.")
+		return nil
+	}
+	rows := make([][]string, 0, len(invites))
+	for _, inv := range invites {
+		rows = append(rows, []string{clean(inv.GroupName, models.MaxGroupNameLen), inv.GroupID, c.name(inv.InviterID),
+			time.Until(inv.ExpiresAt).Truncate(time.Minute).String()})
+	}
+	c.table("GROUP\tID\tFROM\tEXPIRES IN", rows)
+	return nil
+}
+
+func (c *CLI) pendingInviteGroup(ctx context.Context, query string) (string, error) {
+	invites, err := c.Groups.GetPendingInvites(ctx)
+	if err != nil {
+		return "", err
+	}
+	inv, err := pickGroup(query, invites, func(i *models.GroupInvite) (string, string) { return i.GroupID, i.GroupName })
+	if err != nil {
+		return "", errors.New("no pending invitation matches " + strconv.Quote(query) + " (see /invites)")
+	}
+	return inv.GroupID, nil
+}
+
+func (c *CLI) cmdAccept(ctx context.Context, arg string) error {
+	if arg == "" {
+		return errUsage
+	}
+	gid, err := c.pendingInviteGroup(ctx, arg)
+	if err != nil {
+		return err
+	}
+	g, err := c.Handler.AcceptInvite(ctx, gid)
+	if g != nil {
+		c.Console.Printf("Joined group %q.", clean(g.Name, models.MaxGroupNameLen))
+	}
+	return err
+}
+
+func (c *CLI) cmdDecline(ctx context.Context, arg string) error {
+	if arg == "" {
+		return errUsage
+	}
+	gid, err := c.pendingInviteGroup(ctx, arg)
+	if err != nil {
+		return err
+	}
+	if err := c.Handler.DeclineInvite(ctx, gid); err != nil {
+		return err
+	}
+	c.Console.Printf("Declined the invitation.")
+	return nil
+}
+
+func (c *CLI) cmdLeave(ctx context.Context, arg string) error {
+	if arg == "" {
+		return errUsage
+	}
+	g, err := c.resolveGroup(ctx, arg)
+	if err != nil {
+		return err
+	}
+	if err := c.Handler.LeaveGroup(ctx, g.ID); err != nil {
+		return err
+	}
+	c.Console.Printf("Left group %q.", clean(g.Name, models.MaxGroupNameLen))
+	return nil
+}
+
+func (c *CLI) cmdKick(ctx context.Context, arg string) error {
+	parts := splitN(arg, 2)
+	if len(parts) != 2 {
+		return errUsage
+	}
+	g, err := c.resolveGroup(ctx, parts[0])
+	if err != nil {
+		return err
+	}
+	members, err := c.Groups.GetGroupMembers(ctx, g.ID)
+	if err != nil {
+		return err
+	}
+	// Members may not be discovered peers, so resolve within the roster too.
+	peerID, err := pickGroupMember(parts[1], members)
+	if err != nil {
+		return err
+	}
+	if err := c.Handler.RemoveMember(ctx, g.ID, peerID); err != nil {
+		return err
+	}
+	c.Console.Printf("Removed %s from %q.", c.name(peerID), clean(g.Name, models.MaxGroupNameLen))
+	return nil
+}
+
+func pickGroupMember(query string, members []*models.GroupMember) (string, error) {
+	m, err := pickGroup(query, members, func(m *models.GroupMember) (string, string) { return m.PeerID, m.Username })
+	if err != nil {
+		return "", errors.New("no member matches " + strconv.Quote(query))
+	}
+	return m.PeerID, nil
+}
+
+// ---- History -------------------------------------------------------------
+
+func (c *CLI) printMessages(msgs []*models.ChatMessage, groupNames map[string]string) {
+	for _, m := range services.Chronological(msgs) {
+		mark := ""
+		if m.From == c.SelfID && !m.Delivered {
+			mark = "  (not delivered)"
+		}
+		where := ""
+		if m.IsGroupMessage() {
+			label := groupNames[m.GroupID]
+			if label == "" {
+				label = m.GroupID[:min(8, len(m.GroupID))]
+			}
+			where = "[" + clean(label, models.MaxGroupNameLen) + "] "
+		}
+		c.Console.Printf("[%s] %s%s: %s%s", m.Timestamp.Format("2006-01-02 15:04:05"), where, c.name(m.From), clean(m.Message, 0), mark)
+	}
+}
+
+func (c *CLI) groupNameIndex(ctx context.Context) map[string]string {
+	idx := map[string]string{}
+	if groups, err := c.Groups.GetUserGroups(ctx); err == nil {
+		for _, g := range groups {
+			idx[g.ID] = g.Name
+		}
+	}
+	return idx
+}
+
+func (c *CLI) cmdHistory(ctx context.Context, arg string) error {
+	parts := splitN(arg, 2)
+	if len(parts) == 0 {
+		return errUsage
+	}
+	id, err := c.resolvePeer(parts[0])
+	if err != nil {
+		return err
+	}
+	n := defaultCount
+	if len(parts) == 2 {
+		if n, err = parseCount(parts[1]); err != nil {
 			return err
 		}
 	}
-	fmt.Printf("[Group %s] %s: %s\n", groupID, c.username, message)
-	return nil
-}
-
-func (c *CLI) inviteToGroup(groupID, peerID string) error {
-	_, err := c.groupService.InviteToGroup(groupID, c.username, peerID, 24*time.Hour) // 24 hour expiry
+	msgs, err := c.History.GetDirectMessageHistory(ctx, id, storage.Page{Limit: n})
 	if err != nil {
-		fmt.Printf("Failed to invite user: %v\n", err)
 		return err
 	}
-	fmt.Printf("Invitation sent to %s for group %s\n", peerID, groupID)
+	if len(msgs) == 0 {
+		c.Console.Printf("No messages with %s.", c.name(id))
+		return nil
+	}
+	c.Console.Printf("Conversation with %s (newest %d):", c.name(id), len(msgs))
+	c.printMessages(msgs, nil)
 	return nil
 }
 
-func (c *CLI) showPendingInvites() {
-	invites, err := c.groupService.GetPendingInvites(c.username)
+func (c *CLI) cmdGroupHistory(ctx context.Context, arg string) error {
+	parts := splitN(arg, 2)
+	if len(parts) == 0 {
+		return errUsage
+	}
+	g, err := c.resolveGroup(ctx, parts[0])
 	if err != nil {
-		fmt.Printf("Failed to get pending invites: %v\n", err)
-		return
-	}
-
-	if len(invites) == 0 {
-		fmt.Println("No pending invites")
-		return
-	}
-
-	fmt.Println("Pending invites:")
-	for _, invite := range invites {
-		fmt.Printf("  Group %s invited by %s\n", invite.GroupID, invite.InviterID)
-		fmt.Printf("    Invited: %s\n", invite.CreatedAt.Format("2006-01-02 15:04:05"))
-	}
-}
-
-func (c *CLI) acceptInvite(groupID string) error {
-	err := c.groupService.AcceptInvite(groupID, c.username)
-	if err != nil {
-		fmt.Printf("Failed to accept invite: %v\n", err)
 		return err
 	}
-	fmt.Printf("Successfully joined group %s\n", groupID)
-	return nil
-}
-
-func (c *CLI) declineInvite(groupID string) error {
-	err := c.groupService.DeclineInvite(groupID, c.username)
-	if err != nil {
-		fmt.Printf("Failed to decline invite: %v\n", err)
-		return err
-	}
-	fmt.Printf("Declined invite to group %s\n", groupID)
-	return nil
-}
-
-// Message history command handlers
-func (c *CLI) showMessageHistory(peerID string) {
-	messages, err := c.messageHistory.GetDirectMessageHistory(c.username, peerID, 50, 0)
-	if err != nil {
-		fmt.Printf("Failed to get message history: %v\n", err)
-		return
-	}
-
-	if len(messages) == 0 {
-		fmt.Printf("No message history with %s\n", peerID)
-		return
-	}
-
-	fmt.Printf("Message history with %s:\n", peerID)
-	for _, msg := range messages {
-		timestamp := msg.Timestamp.Format("2006-01-02 15:04:05")
-		fmt.Printf("[%s] %s: %s\n", timestamp, msg.From, msg.Message)
-	}
-}
-
-func (c *CLI) showGroupHistory(groupID string) {
-	messages, err := c.messageHistory.GetGroupMessageHistory(groupID, 50, 0)
-	if err != nil {
-		fmt.Printf("Failed to get group history: %v\n", err)
-		return
-	}
-
-	if len(messages) == 0 {
-		fmt.Printf("No message history for group %s\n", groupID)
-		return
-	}
-
-	fmt.Printf("Message history for group %s:\n", groupID)
-	for _, msg := range messages {
-		timestamp := msg.Timestamp.Format("2006-01-02 15:04:05")
-		fmt.Printf("[%s] %s: %s\n", timestamp, msg.From, msg.Message)
-	}
-}
-
-func (c *CLI) showRecentMessages() {
-	messages, err := c.messageHistory.GetRecentMessages(c.username, 20)
-	if err != nil {
-		fmt.Printf("Failed to get recent messages: %v\n", err)
-		return
-	}
-
-	if len(messages) == 0 {
-		fmt.Println("No recent messages")
-		return
-	}
-
-	fmt.Println("Recent messages:")
-	for _, msg := range messages {
-		timestamp := msg.Timestamp.Format("2006-01-02 15:04:05")
-		if msg.GroupID != "" {
-			fmt.Printf("[%s] [Group %s] %s: %s\n", timestamp, msg.GroupID, msg.From, msg.Message)
-		} else {
-			fmt.Printf("[%s] %s: %s\n", timestamp, msg.From, msg.Message)
+	n := defaultCount
+	if len(parts) == 2 {
+		if n, err = parseCount(parts[1]); err != nil {
+			return err
 		}
 	}
+	msgs, err := c.History.GetGroupMessageHistory(ctx, g.ID, storage.Page{Limit: n})
+	if err != nil {
+		return err
+	}
+	if len(msgs) == 0 {
+		c.Console.Printf("No messages in %q.", clean(g.Name, models.MaxGroupNameLen))
+		return nil
+	}
+	c.Console.Printf("Group %q (newest %d):", clean(g.Name, models.MaxGroupNameLen), len(msgs))
+	c.printMessages(msgs, map[string]string{g.ID: g.Name})
+	return nil
 }
 
-// parseNumber safely parses a string to integer
-func (c *CLI) parseNumber(s string) (int, error) {
-	n, err := strconv.Atoi(s)
+func (c *CLI) cmdRecent(ctx context.Context, arg string) error {
+	n, err := parseCount(arg)
 	if err != nil {
-		return 0, fmt.Errorf("invalid number: %s", s)
+		return err
 	}
-	return n, nil
+	msgs, err := c.History.GetRecentMessages(ctx, n)
+	if err != nil {
+		return err
+	}
+	if len(msgs) == 0 {
+		c.Console.Printf("No messages yet.")
+		return nil
+	}
+	c.Console.Printf("Recent messages:")
+	c.printMessages(msgs, c.groupNameIndex(ctx))
+	return nil
+}
+
+func (c *CLI) cmdSearch(ctx context.Context, arg string) error {
+	if arg == "" {
+		return errUsage
+	}
+	msgs, err := c.History.SearchMessages(ctx, arg, storage.Page{Limit: defaultCount})
+	if err != nil {
+		return err
+	}
+	if len(msgs) == 0 {
+		c.Console.Printf("No messages contain %q.", clean(arg, 60))
+		return nil
+	}
+	c.Console.Printf("%d match(es):", len(msgs))
+	c.printMessages(msgs, c.groupNameIndex(ctx))
+	return nil
+}
+
+func (c *CLI) cmdExport(ctx context.Context, arg string) error {
+	parts := splitN(arg, 2)
+	if len(parts) < 2 {
+		return errUsage
+	}
+	target, rest := parts[0], parts[1]
+
+	// "<file> [format]": a trailing known format word is the format.
+	format, path := "text", rest
+	if i := strings.LastIndexAny(rest, " 	"); i > 0 {
+		if last := strings.ToLower(strings.TrimSpace(rest[i:])); slices.Contains(services.ExportFormats, last) {
+			format, path = last, strings.TrimSpace(rest[:i])
+		}
+	}
+	path = strings.Trim(path, `"'`)
+
+	// A group (by name or ID) first, then a peer.
+	conversation, isGroup := "", false
+	if g, err := c.resolveGroup(ctx, target); err == nil {
+		conversation, isGroup = g.ID, true
+	} else if id, perr := c.resolvePeer(target); perr == nil {
+		conversation = id
+	} else {
+		return fmt.Errorf("%q is neither a group nor a peer", target)
+	}
+
+	// Never overwrite: an export is a copy of private data.
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return fmt.Errorf("cannot create %s: %w", path, err)
+	}
+	if err := c.History.ExportConversation(ctx, f, conversation, isGroup, format); err != nil {
+		f.Close()
+		_ = os.Remove(path)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	c.Console.Printf("Exported to %s (%s).", path, format)
+	return nil
 }

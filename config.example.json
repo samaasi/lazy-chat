@@ -1,10 +1,23 @@
 {
   "username": "ExampleUser",
   "tcp_port": 8080,
+  "listen_addr": "",
+  "max_connections": 64,
   "discovery_port": 9999,
   "broadcast_addr": "255.255.255.255",
   "discovery_range": 10,
   "broadcast_interval": 5,
   "log_level": "info",
-  "download_dir": "downloads"
+  "log_format": "text",
+  "log_file": "",
+  "notifications_enabled": false,
+  "encryption": "auto",
+  "passphrase_file": "",
+  "relay": true,
+  "relay_max_storage": 67108864,
+  "sealed_sender": "auto",
+  "update_check": true,
+  "download_dir": "downloads",
+  "max_file_size": 268435456,
+  "auto_accept_files": false
 }

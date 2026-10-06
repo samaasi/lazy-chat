@@ -1,7 +1,8 @@
 package models
 
 import (
-	"fmt"
+	"net"
+	"strconv"
 	"time"
 )
 
@@ -19,7 +20,8 @@ func (p *Peer) IsStale(threshold time.Duration) bool {
 	return time.Since(p.LastSeen) > threshold
 }
 
-// Address returns the full network address of the peer
+// NetworkAddress returns the dialable host:port of the peer. IPv6 addresses
+// are bracketed correctly.
 func (p *Peer) NetworkAddress() string {
-	return fmt.Sprintf("%s:%d", p.Address, p.Port)
+	return net.JoinHostPort(p.Address, strconv.Itoa(p.Port))
 }

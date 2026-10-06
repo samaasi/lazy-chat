@@ -2,229 +2,182 @@ package services
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/samaasi/lazy-chat/internal/models"
 	"github.com/samaasi/lazy-chat/internal/storage"
 )
 
+// maxExportMessages bounds a single export so it cannot exhaust memory or disk.
+const maxExportMessages = 200_000
+
+// MessageHistoryService reads and manages the local peer's message history.
+// Every operation is scoped to the local peer: it can only see conversations
+// it took part in and groups it belongs to.
 type MessageHistoryService struct {
-	messageStorage storage.MessageStorage
-	groupStorage   storage.GroupStorage
+	messages storage.MessageStorage
+	groups   storage.GroupStorage
+	selfID   string
 }
 
-func NewMessageHistoryService(messageStorage storage.MessageStorage, groupStorage storage.GroupStorage) *MessageHistoryService {
-	return &MessageHistoryService{
-		messageStorage: messageStorage,
-		groupStorage:   groupStorage,
-	}
+// NewMessageHistoryService creates the history service for the local peer.
+func NewMessageHistoryService(messages storage.MessageStorage, groups storage.GroupStorage, selfID string) *MessageHistoryService {
+	return &MessageHistoryService{messages: messages, groups: groups, selfID: selfID}
 }
 
-// GetDirectMessageHistory retrieves message history between two peers
-func (mhs *MessageHistoryService) GetDirectMessageHistory(peerID1, peerID2 string, limit int, offset int) ([]*models.ChatMessage, error) {
-	if peerID1 == "" || peerID2 == "" {
-		return nil, fmt.Errorf("peer IDs cannot be empty")
-	}
+// Chronological reverses a newest-first page into reading order.
+func Chronological(msgs []*models.ChatMessage) []*models.ChatMessage {
+	out := slices.Clone(msgs)
+	slices.Reverse(out)
+	return out
+}
 
-	messages, err := mhs.messageStorage.GetDirectMessages(context.Background(), peerID1, peerID2, limit, offset)
+// GetDirectMessageHistory retrieves a page of the conversation with peerID, newest first.
+func (s *MessageHistoryService) GetDirectMessageHistory(ctx context.Context, peerID string, p storage.Page) ([]*models.ChatMessage, error) {
+	if peerID == "" {
+		return nil, errors.New("peer ID cannot be empty")
+	}
+	msgs, err := s.messages.GetDirectMessages(ctx, s.selfID, peerID, p)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get direct messages: %w", err)
 	}
-
-	return messages, nil
+	return msgs, nil
 }
 
-// GetGroupMessageHistory retrieves message history for a group
-func (mhs *MessageHistoryService) GetGroupMessageHistory(groupID string, limit int, offset int) ([]*models.ChatMessage, error) {
+// GetGroupMessageHistory retrieves a page of a group's messages, newest first.
+// The local peer must be a member.
+func (s *MessageHistoryService) GetGroupMessageHistory(ctx context.Context, groupID string, p storage.Page) ([]*models.ChatMessage, error) {
 	if groupID == "" {
-		return nil, fmt.Errorf("group ID cannot be empty")
+		return nil, errors.New("group ID cannot be empty")
 	}
-
-	// Verify group exists
-	group, err := mhs.groupStorage.GetGroup(context.Background(), groupID)
+	member, err := s.groups.IsGroupMember(ctx, groupID, s.selfID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to verify group: %w", err)
 	}
-	if group == nil {
-		return nil, fmt.Errorf("group not found")
+	if !member {
+		return nil, ErrNotMember
 	}
-
-	messages, err := mhs.messageStorage.GetGroupMessages(context.Background(), groupID, limit, offset)
+	msgs, err := s.messages.GetGroupMessages(ctx, groupID, p)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get group messages: %w", err)
 	}
-
-	return messages, nil
+	return msgs, nil
 }
 
-// GetRecentMessages retrieves recent messages for a user across all conversations
-func (mhs *MessageHistoryService) GetRecentMessages(userID string, limit int) ([]*models.ChatMessage, error) {
-	if userID == "" {
-		return nil, fmt.Errorf("user ID cannot be empty")
-	}
-
-	// Use GetMessages with pagination as a fallback
-	messages, err := mhs.messageStorage.GetMessages(context.Background(), limit, 0)
+// GetRecentMessages retrieves the newest messages across all conversations.
+func (s *MessageHistoryService) GetRecentMessages(ctx context.Context, limit int) ([]*models.ChatMessage, error) {
+	msgs, err := s.messages.GetMessages(ctx, storage.Page{Limit: limit})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get recent messages: %w", err)
 	}
-
-	return messages, nil
+	return msgs, nil
 }
 
-// SearchMessages searches for messages containing specific text
-func (mhs *MessageHistoryService) SearchMessages(userID, query string, limit int, offset int) ([]*models.ChatMessage, error) {
-	if userID == "" || query == "" {
-		return nil, fmt.Errorf("user ID and query cannot be empty")
+// SearchMessages searches for messages containing specific text.
+func (s *MessageHistoryService) SearchMessages(ctx context.Context, query string, p storage.Page) ([]*models.ChatMessage, error) {
+	if strings.TrimSpace(query) == "" {
+		return nil, errors.New("query cannot be empty")
 	}
-
-	messages, err := mhs.messageStorage.SearchMessages(context.Background(), query, limit, offset)
+	msgs, err := s.messages.SearchMessages(ctx, query, p)
 	if err != nil {
 		return nil, fmt.Errorf("failed to search messages: %w", err)
 	}
-
-	return messages, nil
+	return msgs, nil
 }
 
-// GetMessagesByDateRange retrieves messages within a specific date range
-func (mhs *MessageHistoryService) GetMessagesByDateRange(userID string, startDate, endDate time.Time, limit int, offset int) ([]*models.ChatMessage, error) {
-	if userID == "" {
-		return nil, fmt.Errorf("user ID cannot be empty")
+// GetMessagesByDateRange retrieves messages within a specific date range.
+func (s *MessageHistoryService) GetMessagesByDateRange(ctx context.Context, start, end time.Time, p storage.Page) ([]*models.ChatMessage, error) {
+	if start.After(end) {
+		return nil, errors.New("start date cannot be after end date")
 	}
-
-	if startDate.After(endDate) {
-		return nil, fmt.Errorf("start date cannot be after end date")
-	}
-
-	messages, err := mhs.messageStorage.GetMessagesByTimeRange(context.Background(), startDate, endDate, limit, offset)
+	msgs, err := s.messages.GetMessagesByTimeRange(ctx, start, end, p)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get messages by date range: %w", err)
 	}
-
-	return messages, nil
+	return msgs, nil
 }
 
-// GetUnreadMessages retrieves unread messages for a user
-// Note: This is a placeholder implementation as the storage interface doesn't support this directly
-func (mhs *MessageHistoryService) GetUnreadMessages(userID string) ([]*models.ChatMessage, error) {
-	if userID == "" {
-		return nil, fmt.Errorf("user ID cannot be empty")
+// MarkMessageAsRead marks a message addressed to the local peer as read.
+func (s *MessageHistoryService) MarkMessageAsRead(ctx context.Context, messageID string) error {
+	if messageID == "" {
+		return errors.New("message ID cannot be empty")
 	}
-
-	// Fallback: get recent messages and filter unread ones in application logic
-	messages, err := mhs.messageStorage.GetMessages(context.Background(), 100, 0)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get messages: %w", err)
-	}
-
-	// Filter unread messages (this would need to be implemented based on message status)
-	var unreadMessages []*models.ChatMessage
-	for _, msg := range messages {
-		if !msg.Read {
-			unreadMessages = append(unreadMessages, msg)
-		}
-	}
-
-	return unreadMessages, nil
-}
-
-// MarkMessageAsRead marks a specific message as read
-func (mhs *MessageHistoryService) MarkMessageAsRead(messageID, userID string) error {
-	if messageID == "" || userID == "" {
-		return fmt.Errorf("message ID and user ID cannot be empty")
-	}
-
-	err := mhs.messageStorage.MarkMessageAsRead(context.Background(), messageID)
-	if err != nil {
+	if err := s.messages.MarkMessageAsRead(ctx, s.selfID, messageID); err != nil {
 		return fmt.Errorf("failed to mark message as read: %w", err)
 	}
-
 	return nil
 }
 
-// MarkAllMessagesAsRead marks all messages in a conversation as read
-// Note: This is a placeholder implementation as the storage interface doesn't support this directly
-func (mhs *MessageHistoryService) MarkAllMessagesAsRead(userID, conversationID string, isGroup bool) error {
-	if userID == "" || conversationID == "" {
-		return fmt.Errorf("user ID and conversation ID cannot be empty")
+// DeleteMessage removes a message from the local history. It refuses
+// messages that do not belong to one of the local peer's conversations.
+func (s *MessageHistoryService) DeleteMessage(ctx context.Context, messageID string) error {
+	if messageID == "" {
+		return errors.New("message ID cannot be empty")
 	}
-
-	// This would need to be implemented by getting all messages and marking them individually
-	// For now, return nil as a placeholder
-	return nil
-}
-
-// DeleteMessage deletes a message (soft delete - marks as deleted)
-func (mhs *MessageHistoryService) DeleteMessage(messageID, userID string) error {
-	if messageID == "" || userID == "" {
-		return fmt.Errorf("message ID and user ID cannot be empty")
-	}
-
-	// Note: GetMessage method is not available in the storage interface
-	// For now, we'll just delete the message without ownership verification
-	// In a real implementation, this would need proper authorization
-
-	err := mhs.messageStorage.DeleteMessage(context.Background(), messageID)
-	if err != nil {
+	if err := s.messages.DeleteMessage(ctx, s.selfID, messageID); err != nil {
 		return fmt.Errorf("failed to delete message: %w", err)
 	}
-
 	return nil
 }
 
-// GetConversationList retrieves a list of conversations for a user
-func (mhs *MessageHistoryService) GetConversationList(userID string) ([]ConversationSummary, error) {
-	if userID == "" {
-		return nil, fmt.Errorf("user ID cannot be empty")
+// ExportFormats lists the formats accepted by ExportConversation.
+var ExportFormats = []string{"text", "json"}
+
+// ExportConversation streams a whole conversation to w, oldest first, as
+// "text" or "json" (one JSON object per line). The conversation is read in
+// pages, so memory use stays flat however long it is.
+func (s *MessageHistoryService) ExportConversation(ctx context.Context, w io.Writer, conversationID string, isGroup bool, format string) error {
+	if !slices.Contains(ExportFormats, format) {
+		return fmt.Errorf("unknown export format %q (use %s)", format, strings.Join(ExportFormats, " or "))
 	}
 
-	// Note: GetDirectConversations and GetGroupConversations are not available in the storage interface
-	// This is a placeholder implementation
-	// In a real implementation, this would need to be implemented differently
-
-	// For now, return an empty list
-	var conversations []ConversationSummary
-
-	return conversations, nil
-}
-
-// ConversationSummary represents a summary of a conversation
-type ConversationSummary struct {
-	ID              string    `json:"id"`
-	Name            string    `json:"name"`
-	Type            string    `json:"type"` // "direct" or "group"
-	LastMessage     string    `json:"last_message"`
-	LastMessageTime time.Time `json:"last_message_time"`
-	UnreadCount     int       `json:"unread_count"`
-	Participants    []string  `json:"participants,omitempty"`
-}
-
-// ExportMessageHistory exports message history to a specific format
-func (mhs *MessageHistoryService) ExportMessageHistory(userID string, conversationID string, isGroup bool, format string) ([]byte, error) {
-	if userID == "" {
-		return nil, fmt.Errorf("user ID cannot be empty")
+	// Collect pages newest-first, then write them out oldest-first.
+	var pages [][]*models.ChatMessage
+	total := 0
+	page := storage.Page{Limit: 500}
+	for {
+		var (
+			batch []*models.ChatMessage
+			err   error
+		)
+		if isGroup {
+			batch, err = s.GetGroupMessageHistory(ctx, conversationID, page)
+		} else {
+			batch, err = s.GetDirectMessageHistory(ctx, conversationID, page)
+		}
+		if err != nil {
+			return fmt.Errorf("failed to read messages for export: %w", err)
+		}
+		if len(batch) == 0 {
+			break
+		}
+		pages = append(pages, batch)
+		total += len(batch)
+		if total > maxExportMessages {
+			return fmt.Errorf("conversation has more than %d messages; export a narrower range", maxExportMessages)
+		}
+		page.Before = batch[len(batch)-1].Seq
 	}
 
-	var messages []*models.ChatMessage
-	var err error
-
-	if isGroup {
-		messages, err = mhs.GetGroupMessageHistory(conversationID, 0, 0) // Get all messages
-	} else {
-		messages, err = mhs.GetDirectMessageHistory(userID, conversationID, 0, 0) // Get all messages
+	enc := json.NewEncoder(w)
+	for i := len(pages) - 1; i >= 0; i-- {
+		for _, msg := range Chronological(pages[i]) {
+			if format == "json" {
+				if err := enc.Encode(msg); err != nil {
+					return err
+				}
+				continue
+			}
+			if _, err := fmt.Fprintf(w, "[%s] %s: %s\n", msg.Timestamp.Format("2006-01-02 15:04:05"), msg.From, strings.ReplaceAll(msg.Message, "\n", " ")); err != nil {
+				return err
+			}
+		}
 	}
-
-	if err != nil {
-		return nil, fmt.Errorf("failed to get messages for export: %w", err)
-	}
-
-	// For now, just return a simple text format
-	// In a real implementation, you might support JSON, CSV, etc.
-	var result string
-	for _, msg := range messages {
-		result += fmt.Sprintf("[%s] %s: %s\n", msg.Timestamp.Format("2006-01-02 15:04:05"), msg.From, msg.Message)
-	}
-
-	return []byte(result), nil
+	return nil
 }

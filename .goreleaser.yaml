@@ -1,0 +1,101 @@
+# Release configuration. CI runs this on a version tag; see RELEASING.md.
+version: 2
+project_name: lazy-chat
+
+before:
+  hooks:
+    - go mod verify
+
+builds:
+  - id: lazy-chat
+    main: ./cmd/lazy-chat
+    binary: lazy-chat
+    env:
+      - CGO_ENABLED=0 # the SQLite driver is pure Go, so cross-compiling is safe
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w -X main.version={{ .Tag }}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - id: lazy-chat
+    # The updater and the install scripts rely on exactly this naming:
+    # lazy-chat_<version>_<os>_<arch>.tar.gz (.zip on Windows).
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - LICENSE
+      - README.md
+      - config.example.json
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+# Sign the checksum list; it vouches for every archive. The matching public key
+# is compiled into the program (internal/update/release.pub) and checked by
+# `lazy-chat update`. Produces checksums.txt.sig (base64).
+signs:
+  - id: checksums
+    cmd: cosign
+    artifacts: checksum
+    args:
+      - sign-blob
+      - --yes
+      - --key=env://COSIGN_PRIVATE_KEY
+      - --output-signature=${signature}
+      - ${artifact}
+    signature: ${artifact}.sig
+    output: true
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test"
+
+release:
+  github:
+    owner: samaasi
+    name: lazy-chat
+  prerelease: auto
+
+# Homebrew (macOS): brew install --cask samaasi/tap/lazy-chat
+# GoReleaser deprecated formulas for pre-built binaries in favour of casks. Casks
+# are a macOS feature first; on Linux use scripts/install.sh.
+homebrew_casks:
+  - name: lazy-chat
+    repository:
+      owner: samaasi
+      name: homebrew-tap
+      token: "{{ .Env.TAP_GITHUB_TOKEN }}"
+    directory: Casks
+    homepage: https://github.com/samaasi/lazy-chat
+    description: Serverless, end-to-end encrypted peer-to-peer chat for your local network
+    skip_upload: auto
+    # The binaries are not notarized by Apple; without this Gatekeeper refuses to
+    # start a program downloaded outside the App Store. (Same as GoReleaser's own example.)
+    hooks:
+      post:
+        install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/lazy-chat"]
+          end
+
+# Scoop: scoop bucket add samaasi https://github.com/samaasi/scoop-bucket && scoop install lazy-chat
+scoops:
+  - name: lazy-chat
+    repository:
+      owner: samaasi
+      name: scoop-bucket
+      token: "{{ .Env.TAP_GITHUB_TOKEN }}"
+    homepage: https://github.com/samaasi/lazy-chat
+    description: Serverless, end-to-end encrypted peer-to-peer chat for your local network
+    license: MIT
+    skip_upload: auto

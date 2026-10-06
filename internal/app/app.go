@@ -1,7 +1,11 @@
+// Package app wires the application together and manages its lifecycle.
 package app
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"strings"
@@ -11,283 +15,388 @@ import (
 
 	"github.com/samaasi/lazy-chat/internal/cli"
 	"github.com/samaasi/lazy-chat/internal/config"
-	"github.com/samaasi/lazy-chat/internal/database"
 	"github.com/samaasi/lazy-chat/internal/discovery"
-	"github.com/samaasi/lazy-chat/internal/errors"
+	apperrors "github.com/samaasi/lazy-chat/internal/errors"
 	"github.com/samaasi/lazy-chat/internal/filetransfer"
+	"github.com/samaasi/lazy-chat/internal/identity"
 	"github.com/samaasi/lazy-chat/internal/interfaces"
 	"github.com/samaasi/lazy-chat/internal/logger"
 	"github.com/samaasi/lazy-chat/internal/messaging"
 	"github.com/samaasi/lazy-chat/internal/network"
 	"github.com/samaasi/lazy-chat/internal/notification"
+	"github.com/samaasi/lazy-chat/internal/offline"
 	"github.com/samaasi/lazy-chat/internal/peer"
+	"github.com/samaasi/lazy-chat/internal/relay"
 	"github.com/samaasi/lazy-chat/internal/services"
 	"github.com/samaasi/lazy-chat/internal/storage"
-	"github.com/samaasi/lazy-chat/internal/utils"
+	"github.com/samaasi/lazy-chat/internal/ui"
+	"github.com/samaasi/lazy-chat/internal/vault"
+	"golang.org/x/term"
 )
+
+const (
+	shutdownTimeout = 15 * time.Second
+	cleanupInterval = 30 * time.Second
+	minPeerTTL      = 2 * time.Minute
+)
+
+// Option customises an App; used by tests to avoid the real terminal.
+type Option func(*options)
+
+type options struct {
+	in      io.Reader
+	out     io.Writer
+	version string
+
+	updateNotice func(ctx context.Context) string
+	passphrase   string
+}
+
+// WithIO sets the CLI's input and output.
+func WithIO(in io.Reader, out io.Writer) Option {
+	return func(o *options) { o.in, o.out = in, out }
+}
+
+// WithPassphrase supplies the encryption passphrase directly (for tests and
+// embedding); normally it is typed, or read from a file or the environment.
+func WithPassphrase(p string) Option { return func(o *options) { o.passphrase = p } }
+
+// WithVersion sets the version shown in the banner.
+func WithVersion(v string) Option { return func(o *options) { o.version = v } }
+
+// WithUpdateNotice supplies a function that reports a newer version, or "" if
+// there is none. It runs once in the background after start-up; the app only
+// tells the user, it never updates itself.
+func WithUpdateNotice(fn func(ctx context.Context) string) Option {
+	return func(o *options) { o.updateNotice = fn }
+}
 
 // App represents the main application
 type App struct {
-	config          *config.Config
-	logger          interfaces.Logger
-	idGenerator     interfaces.IDGenerator
-	peerManager     interfaces.PeerManager
-	msgHandler      interfaces.MessageHandler
-	netManager      interfaces.NetworkManager
-	discovery       interfaces.PeerDiscovery
-	transferManager *filetransfer.TransferManager
-	notificationMgr *notification.NotificationManager
-	dbManager       *database.Manager
-	sqliteDB        *storage.SQLiteDB
-	groupService    *services.GroupService
-	messageHistory  *services.MessageHistoryService
-	ctx             context.Context
-	cancel          context.CancelFunc
-	wg              sync.WaitGroup
+	config *config.Config
+	logger *logger.Logger
+
+	version      string
+	updateNotice func(ctx context.Context) string
+
+	id *identity.Identity
+
+	peers     *peer.Manager
+	netMgr    *network.Manager
+	discovery *discovery.Service
+	handler   *messaging.Handler
+	files     *filetransfer.Manager
+	notifier  *notification.NotificationManager
+	relay     *relay.Manager
+	db        *storage.SQLiteDB
+	groups    *services.GroupService
+	history   *services.MessageHistoryService
+	console   *ui.Console
+	cli       *cli.CLI
+
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+
+	mu      sync.Mutex
+	started bool
+	stopped bool
 }
 
-// New creates a new application instance with dependency injection
-func New(cfg *config.Config) (*App, error) {
+// New creates the application and every component it needs. If any step
+// fails, everything created so far is released before returning.
+func New(cfg *config.Config, opts ...Option) (_ *App, err error) {
+	o := options{in: os.Stdin, out: os.Stdout, version: "dev"}
+	for _, f := range opts {
+		f(&o)
+	}
 	if err := cfg.Validate(); err != nil {
-		return nil, errors.Wrap(err, errors.ErrorTypeConfig, "CFG001", "configuration validation failed")
+		return nil, apperrors.Wrap(err, apperrors.ErrorTypeConfig, "CFG001", "configuration validation failed")
 	}
 
-	// Create logger with configured log level and format
-	logLevel, err := logger.ParseLevel(cfg.LogLevel)
-	if err != nil {
-		logLevel = logger.InfoLevel // Fallback to info level
-	}
-
-	var log interfaces.Logger
-	if cfg.LogFile != "" {
-		// Create logger with file output
-		fileLogger, err := logger.NewWithFile(logLevel, cfg.LogFile)
+	// Release partially built state on any error path below.
+	var undo []func()
+	defer func() {
 		if err != nil {
-			return nil, errors.Wrap(err, errors.ErrorTypeConfig, "LOG001", "failed to create file logger")
+			for i := len(undo) - 1; i >= 0; i-- {
+				undo[i]()
+			}
 		}
-		log = fileLogger
-	} else {
-		// Create logger with stdout output
-		log = logger.New(logLevel)
+	}()
+
+	level, lerr := logger.ParseLevel(cfg.LogLevel)
+	if lerr != nil {
+		level = logger.InfoLevel
 	}
-
-	// Set log format
-	if loggerImpl, ok := log.(*logger.Logger); ok {
-		if strings.ToLower(cfg.LogFormat) == "json" {
-			loggerImpl.SetFormat(logger.JSONFormat)
-		} else {
-			loggerImpl.SetFormat(logger.TextFormat)
-		}
-	}
-
-	// Create ID generator
-	idGen := utils.NewIDGenerator()
-
-	// Generate peer ID
-	peerID := idGen.GeneratePoeticID()
-
-	// Create peer manager
-	peerMgr := peer.NewManager(log)
-
-	// Create notification manager
-	notificationMgr := notification.NewNotificationManager(cfg.NotificationsEnabled)
-
-	// Create database manager and initialize
-	dbManager := database.NewManager(cfg.Database)
-	if err := dbManager.Initialize(); err != nil {
-		return nil, errors.Wrap(err, errors.ErrorTypeDatabase, "DB001", "failed to initialize database")
-	}
-
-	// Create storage instances
-	sqliteDB, err := dbManager.CreateStorageInstances()
+	log, err := logger.New(logger.Options{Level: level, Format: logger.ParseFormat(cfg.LogFormat), File: cfg.LogFile})
 	if err != nil {
-		log.Fatal("Failed to create storage instances", "error", err)
+		return nil, apperrors.Wrap(err, apperrors.ErrorTypeConfig, "LOG001", "failed to create logger")
+	}
+	undo = append(undo, func() { _ = log.Close() })
+
+	// Encryption at rest: unlock (or create) the data key first, because the
+	// identity key and the database are both protected by it.
+	vopts := vault.Options{
+		Mode:           vault.Mode(strings.ToLower(cfg.Encryption)),
+		Passphrase:     o.passphrase,
+		PassphraseFile: cfg.PassphraseFile,
+	}
+	if f, ok := o.in.(*os.File); ok && term.IsTerminal(int(f.Fd())) {
+		vopts.Prompt = terminalPassphrasePrompt(f, os.Stderr)
+	}
+	dataVault, err := vault.Open(cfg.DataDir, vopts)
+	if err != nil {
+		return nil, apperrors.Wrap(err, apperrors.ErrorTypeApplication, "ENC001", "failed to unlock encrypted storage").WithContext("data_dir", cfg.DataDir)
+	}
+	// A nil *Vault inside an interface would not compare equal to nil.
+	var sealer identity.Sealer
+	var dbOpts []storage.Option
+	if dataVault != nil {
+		sealer = dataVault
+		dbOpts = append(dbOpts, storage.WithVault(dataVault))
 	}
 
-	// Connect to database
-	if err := sqliteDB.Connect(context.Background()); err != nil {
-		log.Fatal("Failed to connect to database", "error", err)
+	id, err := identity.LoadOrCreateSealed(cfg.DataDir, sealer)
+	if err != nil {
+		return nil, apperrors.Wrap(err, apperrors.ErrorTypeApplication, "ID001", "failed to load peer identity").WithContext("data_dir", cfg.DataDir)
 	}
 
-	// Run migrations
-	if err := sqliteDB.Migrate(context.Background()); err != nil {
-		log.Fatal("Failed to run database migrations", "error", err)
+	if err := os.MkdirAll(cfg.DownloadDir, 0o755); err != nil {
+		return nil, apperrors.Wrap(err, apperrors.ErrorTypeApplication, "APP007", "failed to create download directory").WithContext("dir", cfg.DownloadDir)
 	}
 
-	// Create services
-	groupService := services.NewGroupService(sqliteDB, sqliteDB, peerID)
-	messageHistory := services.NewMessageHistoryService(sqliteDB, sqliteDB)
-
-	// Create file transfer manager with configured download directory
-	downloadDir := cfg.DownloadDir
-	if err := os.MkdirAll(downloadDir, 0755); err != nil {
-		log.Error("Failed to create downloads directory", "error", err, "dir", downloadDir)
+	db := storage.NewSQLiteDB(cfg.Database.Path, dbOpts...)
+	if err := db.Connect(context.Background()); err != nil {
+		return nil, apperrors.Wrap(err, apperrors.ErrorTypeDatabase, "DB001", "failed to open database").WithContext("path", cfg.Database.Path)
 	}
-	transferMgr := filetransfer.NewTransferManager(downloadDir, log)
+	undo = append(undo, func() { _ = db.Close() })
+	if err := db.Migrate(context.Background()); err != nil {
+		return nil, apperrors.Wrap(err, apperrors.ErrorTypeDatabase, "DB002", "failed to run database migrations")
+	}
 
-	// Create network manager first (without message handler)
-	netMgr := network.NewManager(cfg.TCPPort, cfg.Username, log, peerMgr, nil, notificationMgr, idGen)
+	console := ui.NewConsole(o.out)
+	console.SetPrompt("> ")
+	peers := peer.NewManager(log)
+	notifier := notification.NewNotificationManager(cfg.NotificationsEnabled, log)
+	undo = append(undo, notifier.Close)
 
-	// Create message handler with storage and network manager
-	msgHandler := messaging.NewHandler(log, notificationMgr, sqliteDB, groupService, idGen, netMgr)
+	netMgr, err := network.NewManager(network.Options{
+		Port:       cfg.TCPPort,
+		ListenAddr: cfg.ListenAddr,
+		Username:   cfg.Username,
+		MaxInbound: cfg.MaxConnections,
+	}, id, log, peers)
+	if err != nil {
+		return nil, apperrors.Wrap(err, apperrors.ErrorTypeNetwork, "NET005", "failed to set up the network manager")
+	}
 
-	// Set the message handler in network manager
-	netMgr.SetMessageHandler(msgHandler)
+	groups := services.NewGroupService(db, db, id.ID(), cfg.Username)
+	history := services.NewMessageHistoryService(db, db, id.ID())
 
-	// Create discovery service
-	discSvc := discovery.NewService(cfg, log, peerMgr, peerID, cfg.Username, cfg.TCPPort)
+	relayMgr := relay.NewManager(relay.Options{Enabled: cfg.Relay, MaxStorage: cfg.RelayMaxStorage, RequireAnonymous: cfg.SealedSender == "required"}, relay.Deps{
+		Logger: log, Self: id, Net: netMgr, Offline: offline.NewService(id, db), Store: db,
+	})
+	handler := messaging.NewHandler(messaging.Deps{
+		Logger: log, SelfID: id.ID(), SelfName: cfg.Username, Net: netMgr, Store: db,
+		Groups: groups, Peers: peers, Notifier: notifier, Out: console, Relay: relayMgr,
+	})
+	relayMgr.SetHandlers(handler.AcceptRelayed, handler.ApplyReceipt)
+	relayMgr.Register()
+	undo = append(undo, relayMgr.Close)
+	files := filetransfer.NewManager(filetransfer.Options{
+		DownloadDir: cfg.DownloadDir,
+		MaxFileSize: cfg.MaxFileSize,
+		AutoAccept:  cfg.AutoAcceptFiles,
+	}, filetransfer.Deps{
+		Logger: log, Net: netMgr, Out: console, Display: console, Notifier: notifier, Names: handler.DisplayName,
+	})
+	handler.Register()
+	files.Register()
+	undo = append(undo, handler.Close, files.Close)
 
 	ctx, cancel := context.WithCancel(context.Background())
-
-	return &App{
-		config:          cfg,
-		logger:          log,
-		idGenerator:     idGen,
-		peerManager:     peerMgr,
-		msgHandler:      msgHandler,
-		netManager:      netMgr,
-		discovery:       discSvc,
-		transferManager: transferMgr,
-		notificationMgr: notificationMgr,
-		dbManager:       dbManager,
-		sqliteDB:        sqliteDB,
-		groupService:    groupService,
-		messageHistory:  messageHistory,
-		ctx:             ctx,
-		cancel:          cancel,
-	}, nil
+	a := &App{
+		config: cfg, logger: log, id: id, peers: peers, netMgr: netMgr, handler: handler, files: files, relay: relayMgr,
+		notifier: notifier, db: db, groups: groups, history: history, console: console,
+		discovery: discovery.NewService(discovery.OptionsFromConfig(cfg), id, log, peers),
+		ctx:       ctx, cancel: cancel, version: o.version, updateNotice: o.updateNotice,
+	}
+	a.cli = cli.New(cli.Deps{
+		In: o.in, Console: console, SelfID: id.ID(), SelfName: cfg.Username,
+		Peers: peers, Net: netMgr, Handler: handler, Groups: groups, History: history, Files: files, Verify: db, Relay: relayMgr,
+		StartedAt: time.Now(), Version: o.version,
+	})
+	return a, nil
 }
 
-// Start starts all application services
+// ID returns the local peer ID.
+func (a *App) ID() string { return a.id.ID() }
+
+// Port returns the TCP port peers connect to.
+func (a *App) Port() int { return a.netMgr.Port() }
+
+// Peers returns the peer registry.
+func (a *App) Peers() interfaces.PeerManager { return a.peers }
+
+// Network returns the network manager.
+func (a *App) Network() interfaces.NetworkManager { return a.netMgr }
+
+// Handler returns the chat handler.
+func (a *App) Handler() *messaging.Handler { return a.handler }
+
+// Files returns the file transfer manager.
+func (a *App) Files() *filetransfer.Manager { return a.files }
+
+// Groups returns the group service.
+func (a *App) Groups() *services.GroupService { return a.groups }
+
+// CLI returns the command-line interface.
+func (a *App) CLI() *cli.CLI { return a.cli }
+
+// Start starts all application services.
 func (a *App) Start() error {
-	a.logger.Info("Starting P2P Chat Application", "username", a.config.Username, "tcp_port", a.config.TCPPort, "discovery_port", a.config.DiscoveryPort)
-
-	// Start network manager
-	if err := a.netManager.Start(a.ctx); err != nil {
-		return errors.Wrap(err, errors.ErrorTypeNetwork, "NET004", "failed to start network manager")
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.started {
+		return apperrors.ErrAppAlreadyRunning
 	}
 
-	// Start discovery service
+	a.logger.Info("Starting Lazy Chat", "username", a.config.Username, "peer_id", a.id.ID(), "tcp_port", a.config.TCPPort)
+	if err := a.netMgr.Start(a.ctx); err != nil {
+		return apperrors.Wrap(err, apperrors.ErrorTypeNetwork, "NET004", "failed to start network manager")
+	}
 	if err := a.discovery.Start(a.ctx); err != nil {
-		return errors.Wrap(err, errors.ErrorTypeDiscovery, "DISC002", "failed to start discovery service")
+		_ = a.netMgr.Stop()
+		return apperrors.Wrap(err, apperrors.ErrorTypeDiscovery, "DISC002", "failed to start discovery service")
 	}
+	a.started = true
 
-	// Start cleanup routine for stale peers
 	a.wg.Add(1)
 	go a.cleanupRoutine()
-
-	a.logger.Info("All services started successfully")
+	if a.updateNotice != nil {
+		a.wg.Add(1)
+		go a.announceUpdate()
+	}
 	return nil
 }
 
-// Stop gracefully stops all application services
-func (a *App) Stop() error {
-	a.logger.Info("Stopping P2P Chat Application")
-
-	// Cancel context to signal all services to stop
-	a.cancel()
-
-	// Create a timeout context for graceful shutdown
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer shutdownCancel()
-
-	// Channel to signal when shutdown is complete
-	shutdownDone := make(chan struct{})
-
-	go func() {
-		defer close(shutdownDone)
-
-		// Stop discovery service
-		if err := a.discovery.Stop(); err != nil {
-			a.logger.Error("Error stopping discovery service", "error", err)
-		}
-
-		// Stop network manager
-		if err := a.netManager.Stop(); err != nil {
-			a.logger.Error("Error stopping network manager", "error", err)
-		}
-
-		// Wait for all goroutines to finish
-		a.wg.Wait()
-	}()
-
-	// Wait for graceful shutdown or timeout
-	select {
-	case <-shutdownDone:
-		a.logger.Info("Application stopped successfully")
-		return nil
-	case <-shutdownCtx.Done():
-		a.logger.Warn("Graceful shutdown timed out, forcing exit")
-		return errors.New(errors.ErrorTypeApplication, "APP006", "shutdown timeout exceeded")
+// announceUpdate tells the user once if a newer release exists.
+func (a *App) announceUpdate() {
+	defer a.wg.Done()
+	ctx, cancel := context.WithTimeout(a.ctx, 10*time.Second)
+	defer cancel()
+	if v := a.updateNotice(ctx); v != "" {
+		a.console.Printf("* A new version is available: %s (you have %s). Run \"lazy-chat update\" to install it.", v, a.version)
 	}
 }
 
-// Run starts the application and handles graceful shutdown
-func (a *App) Run() error {
-	// Setup signal handling for graceful shutdown
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+// Stop shuts everything down in dependency order and releases all resources.
+// It is safe to call more than once.
+func (a *App) Stop() error {
+	a.mu.Lock()
+	if a.stopped {
+		a.mu.Unlock()
+		return nil
+	}
+	a.stopped = true
+	started := a.started
+	a.mu.Unlock()
 
-	// Start the application
+	a.logger.Info("Stopping Lazy Chat")
+	a.cancel()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if started {
+			_ = a.discovery.Stop()
+		}
+		// Stop producing work before closing the connections it uses.
+		a.handler.Close()
+		a.relay.Close()
+		a.files.Close()
+		if started {
+			_ = a.netMgr.Stop()
+		}
+		a.wg.Wait()
+		a.notifier.Close()
+		if err := a.db.Close(); err != nil {
+			a.logger.Error("Error closing database", "error", err)
+		}
+	}()
+
+	var err error
+	select {
+	case <-done:
+		a.logger.Info("Application stopped")
+	case <-time.After(shutdownTimeout):
+		a.logger.Warn("Graceful shutdown timed out")
+		err = apperrors.ErrAppShutdownTimeout
+	}
+	_ = a.logger.Close()
+	return err
+}
+
+// Run starts the application, runs the CLI and shuts down on /quit, input
+// end of file, or SIGINT/SIGTERM.
+func (a *App) Run() error {
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigs)
+
 	if err := a.Start(); err != nil {
+		_ = a.Stop()
 		return err
 	}
 
-	// Create CLI interface
-	cliInterface := cli.New(a.peerManager, a.netManager, a.logger, a.config.Username, a.groupService, a.messageHistory, a.msgHandler)
+	cliDone := make(chan error, 1)
+	go func() { cliDone <- a.cli.Start(a.ctx) }()
 
-	// Start CLI in a separate goroutine
-	a.wg.Add(1)
-	go func() {
-		defer a.wg.Done()
-		cliInterface.Start(a.ctx)
-	}()
-
-	// Wait for shutdown signal
+	var runErr error
 	select {
-	case sig := <-sigChan:
-		a.logger.Info("Received shutdown signal", "signal", sig)
+	case sig := <-sigs:
+		a.logger.Info("Received shutdown signal", "signal", sig.String())
+		fmt.Fprintln(os.Stdout)
+	case err := <-cliDone:
+		// /quit or end of input: this is what used to hang the program.
+		if err != nil && !errors.Is(err, context.Canceled) {
+			runErr = err
+		}
 	case <-a.ctx.Done():
-		a.logger.Info("Application context cancelled")
 	}
 
-	// Graceful shutdown
-	return a.Stop()
+	if err := a.Stop(); err != nil && runErr == nil {
+		runErr = err
+	}
+	return runErr
 }
 
-// GetPeerManager returns the peer manager
-func (a *App) GetPeerManager() interfaces.PeerManager {
-	return a.peerManager
-}
-
-// GetNetworkManager returns the network manager
-func (a *App) GetNetworkManager() interfaces.NetworkManager {
-	return a.netManager
-}
-
-// GetLogger returns the logger
-func (a *App) GetLogger() interfaces.Logger {
-	return a.logger
-}
-
-// GetConfig returns the configuration
-func (a *App) GetConfig() *config.Config {
-	return a.config
-}
-
-// cleanupRoutine periodically cleans up stale peers
+// cleanupRoutine periodically expires stale peers and invitations.
 func (a *App) cleanupRoutine() {
 	defer a.wg.Done()
 
-	ticker := time.NewTicker(30 * time.Second) // Cleanup every 30 seconds
-	defer ticker.Stop()
+	// Announcements arrive once per interval; allow several to be missed.
+	peerTTL := max(minPeerTTL, 3*time.Duration(a.config.BroadcastInterval)*time.Second)
 
+	ticker := time.NewTicker(cleanupInterval)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-a.ctx.Done():
 			return
 		case <-ticker.C:
-			a.peerManager.CleanupStalePeers(2 * time.Minute) // Remove peers not seen for 2 minutes
+			a.peers.CleanupStalePeers(peerTTL)
+			a.handler.RetryAll(a.ctx)
+			mctx, mcancel := context.WithTimeout(a.ctx, 10*time.Second)
+			if err := a.relay.Maintain(mctx); err != nil && a.ctx.Err() == nil {
+				a.logger.Debug("Relay maintenance failed", "error", err)
+			}
+			mcancel()
+			ctx, cancel := context.WithTimeout(a.ctx, 5*time.Second)
+			if _, err := a.groups.CleanupExpiredInvites(ctx); err != nil && a.ctx.Err() == nil {
+				a.logger.Debug("Invite cleanup failed", "error", err)
+			}
+			cancel()
 		}
 	}
 }
