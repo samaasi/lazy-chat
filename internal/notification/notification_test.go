@@ -167,3 +167,45 @@ func TestUnsupportedOS(t *testing.T) {
 		t.Fatal("expected error")
 	}
 }
+
+// TestRealNotificationIsAcceptedByTheOS runs the real platform helper (no fake
+// runner) and requires it to succeed. It cannot see the toast on screen, but a
+// helper that exits 0 means the OS accepted the notification. Opt in with
+// LAZYCHAT_TEST_NOTIFY=1, because it pops up real notifications and needs a
+// desktop session.
+func TestRealNotificationIsAcceptedByTheOS(t *testing.T) {
+	if os.Getenv("LAZYCHAT_TEST_NOTIFY") != "1" {
+		t.Skip("set LAZYCHAT_TEST_NOTIFY=1 to show real notifications")
+	}
+	nm := NewNotificationManager(true, nil)
+	defer nm.Close()
+
+	var mu sync.Mutex
+	var failures []string
+	real := nm.run
+	nm.run = func(ctx context.Context, c command) error {
+		err := real(ctx, c)
+		mu.Lock()
+		defer mu.Unlock()
+		if err != nil {
+			failures = append(failures, err.Error())
+		}
+		return err
+	}
+	// Hostile text must be shown as text, not break the helper.
+	for _, err := range []error{
+		nm.NotifyMessageReceived("lazy-chat test", `hello from the test suite ' " $(calc) <b>&`),
+		nm.NotifyFileReceived("lazy-chat test", "report.pdf"),
+		nm.NotifyPeerConnected("lazy-chat test"),
+	} {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	nm.Close() // waits for the helpers to finish
+	mu.Lock()
+	defer mu.Unlock()
+	if len(failures) > 0 {
+		t.Fatalf("the OS rejected %d notification(s): %v", len(failures), failures)
+	}
+}
