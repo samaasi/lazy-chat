@@ -4,14 +4,6 @@ import (
 	"time"
 )
 
-// DiscoveryMessage represents a peer discovery broadcast message
-type DiscoveryMessage struct {
-	Type     string `json:"type"`
-	PeerID   string `json:"peer_id"`
-	Username string `json:"username"`
-	Port     int    `json:"port"`
-}
-
 // MessageType represents the type of message
 type MessageType string
 
@@ -21,17 +13,23 @@ const (
 	MessageTypeSystem MessageType = "system"
 )
 
-// ChatMessage represents a chat message between peers or in groups
+// ChatMessage represents a chat message between peers or in groups.
+//
+// On the wire only ID, From, To, GroupID, Message, Type and Timestamp are
+// sent. Delivered and Read are local bookkeeping and are never serialised,
+// so a peer cannot pre-mark its own messages as read or delivered. Seq is the
+// local storage sequence number used for pagination.
 type ChatMessage struct {
-	ID        string      `json:"id" db:"id"`
-	From      string      `json:"from" db:"from_peer_id"`
-	To        string      `json:"to,omitempty" db:"to_peer_id"` // For direct messages
-	GroupID   string      `json:"group_id,omitempty" db:"group_id"` // For group messages
-	Message   string      `json:"message" db:"content"`
-	Type      MessageType `json:"type" db:"message_type"`
-	Timestamp time.Time   `json:"timestamp" db:"created_at"`
-	Delivered bool        `json:"delivered" db:"delivered"`
-	Read      bool        `json:"read" db:"read_status"`
+	Seq       int64       `json:"-"`
+	ID        string      `json:"id"`
+	From      string      `json:"from"`
+	To        string      `json:"to,omitempty"`       // For direct messages
+	GroupID   string      `json:"group_id,omitempty"` // For group messages
+	Message   string      `json:"message"`
+	Type      MessageType `json:"type"`
+	Timestamp time.Time   `json:"timestamp"`
+	Delivered bool        `json:"-"`
+	Read      bool        `json:"-"`
 }
 
 // NewChatMessage creates a new direct chat message with current timestamp
@@ -43,8 +41,6 @@ func NewChatMessage(id, from, to, message string) *ChatMessage {
 		Message:   message,
 		Type:      MessageTypeDirect,
 		Timestamp: time.Now(),
-		Delivered: false,
-		Read:      false,
 	}
 }
 
@@ -57,8 +53,6 @@ func NewGroupMessage(id, from, groupID, message string) *ChatMessage {
 		Message:   message,
 		Type:      MessageTypeGroup,
 		Timestamp: time.Now(),
-		Delivered: false,
-		Read:      false,
 	}
 }
 
@@ -71,41 +65,14 @@ func NewSystemMessage(id, message string) *ChatMessage {
 		Type:      MessageTypeSystem,
 		Timestamp: time.Now(),
 		Delivered: true,
-		Read:      false,
 	}
 }
 
 // IsDirectMessage checks if the message is a direct message
-func (m *ChatMessage) IsDirectMessage() bool {
-	return m.Type == MessageTypeDirect
-}
+func (m *ChatMessage) IsDirectMessage() bool { return m.Type == MessageTypeDirect }
 
 // IsGroupMessage checks if the message is a group message
-func (m *ChatMessage) IsGroupMessage() bool {
-	return m.Type == MessageTypeGroup
-}
+func (m *ChatMessage) IsGroupMessage() bool { return m.Type == MessageTypeGroup }
 
 // IsSystemMessage checks if the message is a system message
-func (m *ChatMessage) IsSystemMessage() bool {
-	return m.Type == MessageTypeSystem
-}
-
-// MarkAsDelivered marks the message as delivered
-func (m *ChatMessage) MarkAsDelivered() {
-	m.Delivered = true
-}
-
-// MarkAsRead marks the message as read
-func (m *ChatMessage) MarkAsRead() {
-	m.Read = true
-}
-
-// NewDiscoveryMessage creates a new discovery announcement message
-func NewDiscoveryMessage(peerID, username string, port int) *DiscoveryMessage {
-	return &DiscoveryMessage{
-		Type:     "announce",
-		PeerID:   peerID,
-		Username: username,
-		Port:     port,
-	}
-}
+func (m *ChatMessage) IsSystemMessage() bool { return m.Type == MessageTypeSystem }
