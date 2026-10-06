@@ -42,6 +42,16 @@ const (
 	KindRatchetInit Kind = 8
 	KindSecure      Kind = 9
 
+	// Offline delivery: prekey bundles and store-and-forward relaying.
+	KindPrekeys        Kind = 20 // our bundle, sent when a connection starts
+	KindBundleRequest  Kind = 21 // "do you hold a bundle for peer X?"
+	KindBundleResponse Kind = 22
+	KindRelayStore     Kind = 23 // sender -> relay: hold this for the recipient
+	KindRelayStored    Kind = 24 // relay -> sender: accepted or refused
+	KindRelayDeliver   Kind = 25 // relay -> recipient: here is a held message
+	KindRelayAck       Kind = 26 // recipient -> relay: got it (with a signed receipt)
+	KindRelayReceipt   Kind = 27 // relay -> sender: the recipient's signed receipt
+
 	KindFileOffer  Kind = 10
 	KindFileAccept Kind = 11
 	KindFileChunk  Kind = 12
@@ -80,6 +90,14 @@ func MaxBody(k Kind) int {
 		return idRawLen + MaxChunkSize
 	case KindRatchetInit:
 		return 1 << 10
+	case KindPrekeys, KindBundleResponse:
+		return 16 << 10
+	case KindBundleRequest:
+		return 1 << 10
+	case KindRelayStore, KindRelayDeliver:
+		return 40 << 10 // a 24 KiB sealed message, base64-encoded inside JSON
+	case KindRelayStored, KindRelayAck, KindRelayReceipt:
+		return 4 << 10
 	case KindSecure:
 		// The largest inner frame, plus its kind byte and the ratchet's
 		// header and authentication tag.
@@ -101,7 +119,9 @@ func (k Kind) Application() bool {
 
 func (k Kind) known() bool {
 	switch k {
-	case KindHello, KindPing, KindRatchetInit, KindSecure, KindMessage, KindAck, KindGroupInvite, KindGroupInviteReply,
+	case KindHello, KindPing, KindRatchetInit, KindSecure,
+		KindPrekeys, KindBundleRequest, KindBundleResponse, KindRelayStore, KindRelayStored,
+		KindRelayDeliver, KindRelayAck, KindRelayReceipt, KindMessage, KindAck, KindGroupInvite, KindGroupInviteReply,
 		KindGroupUpdate, KindFileOffer, KindFileAccept, KindFileChunk, KindFileDone,
 		KindFileResult, KindFileAbort:
 		return true
@@ -269,4 +289,65 @@ type FileResult struct {
 type FileAbort struct {
 	TransferID string `json:"transfer_id"`
 	Reason     string `json:"reason,omitempty"`
+}
+
+// ---- Offline delivery ----------------------------------------------------------
+
+// Prekeys carries a prekey bundle (see package offline) as raw JSON, so this
+// package does not depend on it.
+type Prekeys struct {
+	Bundle json.RawMessage `json:"bundle"`
+}
+
+// BundleRequest asks a peer whether it holds a bundle for PeerID.
+type BundleRequest struct {
+	PeerID string `json:"peer_id"`
+}
+
+// BundleResponse answers a BundleRequest; Bundle is empty when unknown.
+type BundleResponse struct {
+	PeerID string          `json:"peer_id"`
+	Bundle json.RawMessage `json:"bundle,omitempty"`
+}
+
+// RelayStore asks a relay to hold an end-to-end encrypted message for To. The
+// sender is the authenticated peer, so it is not repeated here.
+type RelayStore struct {
+	ID      string `json:"id"`
+	To      string `json:"to"`
+	Blob    []byte `json:"blob"`
+	Expires int64  `json:"expires"` // unix milliseconds
+}
+
+// RelayStored is the relay's answer to a RelayStore.
+type RelayStored struct {
+	ID     string `json:"id"`
+	OK     bool   `json:"ok"`
+	Reason string `json:"reason,omitempty"`
+}
+
+// RelayDeliver hands a held message to its recipient.
+type RelayDeliver struct {
+	ID      string `json:"id"`
+	From    string `json:"from"`
+	Blob    []byte `json:"blob"`
+	Created int64  `json:"created"`
+}
+
+// RelayAck tells the relay the recipient has dealt with an envelope. When
+// Delivered, it carries the recipient's signed receipt for the sender.
+type RelayAck struct {
+	ID        string `json:"id"`
+	Delivered bool   `json:"delivered"`
+	MsgID     string `json:"msg_id,omitempty"`
+	EdPub     []byte `json:"ed,omitempty"`
+	Sig       []byte `json:"sig,omitempty"`
+}
+
+// RelayReceipt forwards a recipient's signed delivery receipt to the sender.
+type RelayReceipt struct {
+	MsgID  string `json:"msg_id"`
+	Signer string `json:"signer"`
+	EdPub  []byte `json:"ed"`
+	Sig    []byte `json:"sig"`
 }
