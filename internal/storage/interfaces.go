@@ -49,6 +49,18 @@ type MessageStorage interface {
 	DeleteMessage(ctx context.Context, userID, messageID string) error
 	// SearchMessages searches for messages containing specific text
 	SearchMessages(ctx context.Context, query string, p Page) ([]*models.ChatMessage, error)
+	// GetUndeliveredDirect returns direct messages from fromPeerID to
+	// toPeerID that were never acknowledged (oldest first, none older than since).
+	GetUndeliveredDirect(ctx context.Context, fromPeerID, toPeerID string, since time.Time, limit int) ([]*models.ChatMessage, error)
+	// PeersWithUndelivered lists recipients that have unacknowledged messages.
+	PeersWithUndelivered(ctx context.Context, fromPeerID string, since time.Time) ([]string, error)
+}
+
+// VerificationStorage records which peers the user has verified out of band.
+type VerificationStorage interface {
+	SetVerified(ctx context.Context, peerID string, verified bool) error
+	IsVerified(ctx context.Context, peerID string) (bool, error)
+	ListVerified(ctx context.Context) (map[string]time.Time, error)
 }
 
 // GroupStorage defines the interface for group persistence
@@ -103,6 +115,7 @@ type Database interface {
 	MessageStorage
 	GroupStorage
 	InviteStorage
+	VerificationStorage
 	// Connect establishes database connection
 	Connect(ctx context.Context) error
 	// Close closes database connection

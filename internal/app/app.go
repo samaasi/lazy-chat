@@ -319,6 +319,7 @@ func (a *App) cleanupRoutine() {
 			return
 		case <-ticker.C:
 			a.peers.CleanupStalePeers(peerTTL)
+			a.handler.RetryAll(a.ctx)
 			ctx, cancel := context.WithTimeout(a.ctx, 5*time.Second)
 			if _, err := a.groups.CleanupExpiredInvites(ctx); err != nil && a.ctx.Err() == nil {
 				a.logger.Debug("Invite cleanup failed", "error", err)

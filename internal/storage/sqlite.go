@@ -163,6 +163,14 @@ var migrations = [][]string{
 		`CREATE INDEX idx_group_invites_invitee ON group_invites (invitee_id, status, expires_at)`,
 		`CREATE INDEX idx_group_invites_group ON group_invites (group_id)`,
 	},
+	{ // 2: out-of-band verification, and fast lookup of undelivered messages
+		`CREATE TABLE verified_peers (
+			peer_id     TEXT PRIMARY KEY,
+			verified_at INTEGER NOT NULL
+		)`,
+		`CREATE INDEX idx_msg_undelivered ON messages (to_peer_id, seq)
+			WHERE delivered = 0 AND deleted_at IS NULL AND message_type = 'direct'`,
+	},
 }
 
 // legacyTables are the tables of the two incompatible schemas older versions

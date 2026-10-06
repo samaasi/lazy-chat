@@ -67,6 +67,8 @@ type Handler struct {
 	// names remembers the last display name seen per peer, so a peer that
 	// just disconnected can still be named in the "disconnected" line.
 	names sync.Map // peer ID -> string
+
+	retrying sync.Map // peer ID -> struct{}: a retry to that peer is in flight
 }
 
 var _ interfaces.PeerListener = (*Handler)(nil)
@@ -392,6 +394,12 @@ func (h *Handler) PeerConnected(peerID, username string) {
 	if h.isClosed() {
 		return
 	}
+	// Anything we could not deliver earlier goes out now.
+	h.background(func(ctx context.Context) {
+		if _, err := h.RetryUndelivered(ctx, peerID); err != nil {
+			h.Logger.Debug("Retry on connect failed", "peer", shortID(peerID), "error", err)
+		}
+	})
 	name := h.DisplayName(peerID)
 	h.Out.Printf("* %s connected", name)
 	if h.Notifier != nil {

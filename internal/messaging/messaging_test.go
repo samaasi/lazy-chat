@@ -38,19 +38,20 @@ type fakeNet struct {
 	sent     []sentFrame
 	names    map[string]string
 	failFor  map[string]error
+	offline  map[string]bool
 	handlers map[protocol.Kind]interfaces.FrameHandler
 	listener []interfaces.PeerListener
 }
 
 func newFakeNet() *fakeNet {
-	return &fakeNet{names: map[string]string{}, failFor: map[string]error{}, handlers: map[protocol.Kind]interfaces.FrameHandler{}}
+	return &fakeNet{names: map[string]string{}, failFor: map[string]error{}, offline: map[string]bool{}, handlers: map[protocol.Kind]interfaces.FrameHandler{}}
 }
 
 func (f *fakeNet) Start(context.Context) error                       { return nil }
 func (f *fakeNet) Stop() error                                       { return nil }
 func (f *fakeNet) ConnectToPeer(context.Context, string) error       { return nil }
 func (f *fakeNet) Disconnect(string)                                 {}
-func (f *fakeNet) IsConnected(string) bool                           { return true }
+func (f *fakeNet) IsConnected(id string) bool                        { return !f.offline[id] }
 func (f *fakeNet) ConnectedPeers() []string                          { return nil }
 func (f *fakeNet) Handle(k protocol.Kind, h interfaces.FrameHandler) { f.handlers[k] = h }
 func (f *fakeNet) AddListener(l interfaces.PeerListener)             { f.listener = append(f.listener, l) }
