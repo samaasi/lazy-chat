@@ -84,7 +84,7 @@ func New(cfg *config.Config) (*App, error) {
 	idGen := utils.NewIDGenerator()
 
 	// Generate peer ID
-	peerID := idGen.GeneratePoeticID()
+	peerID := idGen.GenerateID()
 
 	// Create peer manager
 	peerMgr := peer.NewManager(log)

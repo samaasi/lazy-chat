@@ -8,6 +8,7 @@ import (
 
 	"github.com/samaasi/lazy-chat/internal/models"
 	"github.com/samaasi/lazy-chat/internal/storage"
+	"github.com/samaasi/lazy-chat/internal/utils"
 )
 
 type GroupService struct {
@@ -81,7 +82,7 @@ func (gs *GroupService) JoinGroup(groupID, peerID string) error {
 	// Add to group's member map
 	group.AddMember(peerID, peerID)
 	err = gs.groupStorage.UpdateGroup(context.Background(), group)
-		if err != nil {
+	if err != nil {
 		return fmt.Errorf("failed to update group: %w", err)
 	}
 
@@ -260,9 +261,9 @@ func (gs *GroupService) DeclineInvite(groupID, peerID string) error {
 
 // Helper functions for ID generation
 func generateGroupID() string {
-	return fmt.Sprintf("group_%d", time.Now().UnixNano())
+	return utils.NewPrefixedID("grp")
 }
 
 func generateInviteID() string {
-	return fmt.Sprintf("invite_%d", time.Now().UnixNano())
+	return utils.NewPrefixedID("inv")
 }

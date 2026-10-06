@@ -85,6 +85,6 @@ type Logger interface {
 
 // IDGenerator generates unique identifiers
 type IDGenerator interface {
-	// GeneratePoeticID creates a poetic identifier
-	GeneratePoeticID() string
+	// GenerateID creates a poetic identifier
+	GenerateID() string
 }

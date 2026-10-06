@@ -128,7 +128,7 @@ func (h *Handler) displayMessage(msg *models.ChatMessage) {
 
 // SendMessage sends a message to a specific peer
 func (h *Handler) SendMessage(to, content string) error {
-	message := models.NewChatMessage(h.idGenerator.GeneratePoeticID(), "", to, content)
+	message := models.NewChatMessage(h.idGenerator.GenerateID(), "", to, content)
 
 	if err := h.ValidateMessage(message); err != nil {
 		return err
@@ -153,7 +153,7 @@ func (h *Handler) SendMessage(to, content string) error {
 
 // SendGroupMessage sends a message to a group
 func (h *Handler) SendGroupMessage(groupID, content string) error {
-	message := models.NewChatMessage(h.idGenerator.GeneratePoeticID(), "", groupID, content)
+	message := models.NewChatMessage(h.idGenerator.GenerateID(), "", groupID, content)
 	message.Type = models.MessageTypeGroup
 	message.GroupID = groupID
 

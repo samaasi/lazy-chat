@@ -153,7 +153,7 @@ func (m *Manager) SendMessage(peerID, message string) error {
 		return errors.ErrPeerNotConnected.WithContext("peer_id", peerID)
 	}
 
-	chatMsg := models.NewChatMessage(m.idGenerator.GeneratePoeticID(), m.username, peerID, message)
+	chatMsg := models.NewChatMessage(m.idGenerator.GenerateID(), m.username, peerID, message)
 	data, err := json.Marshal(chatMsg)
 	if err != nil {
 		return errors.Wrap(err, errors.ErrorTypeMessage, "MSG005", "failed to marshal message").WithContext("peer_id", peerID)
