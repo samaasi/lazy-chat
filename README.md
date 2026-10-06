@@ -37,7 +37,7 @@ One command, no dependencies. Each installer downloads the release for your mach
 | **Windows** (Scoop) | `scoop bucket add samaasi https://github.com/samaasi/scoop-bucket` then `scoop install lazy-chat` |
 | **Go 1.27+** | `go install github.com/samaasi/lazy-chat/cmd/lazy-chat@latest` |
 
-The scripts install to `/usr/local/bin` (or `~/.local/bin` if that is not writable) and `%LOCALAPPDATA%\Programs\lazy-chat` (added to your user `PATH`; no administrator rights needed). Set `LAZYCHAT_VERSION=v1.2.3` to pin a version and `LAZYCHAT_INSTALL_DIR` to choose the folder. You can also download an archive from the [Releases](https://github.com/samaasi/lazy-chat/releases) page (Linux, macOS and Windows; amd64 and arm64) or build from source:
+The scripts install to `/usr/local/bin` (or `~/.local/bin` if that is not writable) and `%LOCALAPPDATA%\Programs\lazy-chat` (added to your user `PATH`; no administrator rights needed). Set `LAZYCHAT_VERSION=v1.2.3` to pin a version and `LAZYCHAT_INSTALL_DIR` to choose the folder. On Windows the installer also offers to let lazy-chat through Windows Firewall (one administrator prompt; see [Firewall](#firewall)); `LAZYCHAT_NO_FIREWALL=1` skips that. You can also download an archive from the [Releases](https://github.com/samaasi/lazy-chat/releases) page (Linux, macOS and Windows; amd64 and arm64) or build from source:
 
 ```bash
 git clone https://github.com/samaasi/lazy-chat.git
@@ -96,6 +96,8 @@ lazy-chat -u Bob   -p 8081 --data-dir /tmp/bob
 | `/search <text>` | Search all messages |
 | `/export <peer\|group> <file> [text\|json]` | Export a conversation to a *new* file |
 | `/relay` | Show how many messages you are holding for offline peers |
+| `/firewall` | Let other peers find and reach you through the firewall (Windows: one administrator prompt) |
+| `/forget <peer>` | Stop remembering a peer's address, so it is not reconnected automatically |
 | `/status`, `/quit` | Status and exit |
 
 ## Configuration
@@ -112,6 +114,7 @@ The config file is `./config.json` if present, or the path given with `-c/--conf
 | `--max-connections` / `max_connections` | `64` | Simultaneous inbound connections |
 | `--discovery-port`, `--discovery-range` | `9999`, `10` | First UDP port and how many to use |
 | `--broadcast-addr`, `--broadcast-interval` | `255.255.255.255`, `5` | Where and how often to announce |
+| `--remember-peers` / `remember_peers` | on | Remember where connected peers were and reconnect to them; turning it off forgets them all |
 | `--peer` / `peers` / `P2P_PEERS` | none | Addresses to connect to at start-up, retried for a few minutes: `host[:port]` or `<peer id>@host[:port]`. Repeat the flag, or comma-separate the variable |
 | `--data-dir` / `data_dir` | `~/.lazy-chat` | Identity key, key vault and database |
 | `--db-path` / `database.path` | `<data-dir>/lazy-chat.db` | SQLite database |
@@ -190,7 +193,7 @@ Forward secrecy for offline messages comes from deleting keys. Each message uses
 
 **What is not protected**
 
-- *Metadata.* Peer IDs, timestamps, group IDs and delivery flags stay readable in the database (they are needed to query it), and discovery announcements (username, TCP port) are broadcast in clear text to the whole LAN. Anyone on the network can see *that* you are online, though not what you say. A relay additionally learns who a held message is for, and when; it does not learn who sent it unless you had too few peers connected to use a forwarder (see sealed sender).
+- *Metadata.* Peer IDs, remembered peer addresses, timestamps, group IDs and delivery flags stay readable in the database (they are needed to query it), and discovery announcements (username, TCP port) are broadcast in clear text to the whole LAN. Anyone on the network can see *that* you are online, though not what you say. A relay additionally learns who a held message is for, and when; it does not learn who sent it unless you had too few peers connected to use a forwarder (see sealed sender).
 - *Received files and exports* are ordinary files and are not encrypted; keep them on an encrypted disk if that matters.
 - *Memory.* Keys and plaintext exist in process memory while the program runs. The OS keychain protects against another user or a stolen disk, not against malware running as you.
 - *Ratchet scope.* Ratchet sessions live as long as a connection; they are not stored. Retried messages are re-encrypted for the new connection. Offline messages use their own per-message encryption (above) rather than a ratchet, so they have no post-compromise healing.
@@ -284,6 +287,18 @@ GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o lazy-chat-linux-arm64 ./cmd/la
 
 ## Troubleshooting
 
+### Firewall
+
+Every firewall drops unsolicited inbound packets, which is exactly what discovery announcements and incoming chats are, and no program can (or should) get around that on its own. So lazy-chat asks once:
+
+- **Windows**: on first run, if Windows Firewall would keep peers out, the app asks `Allow lazy-chat on private networks? [Y/n]` and, on yes, adds one rule for its own program through a single administrator prompt. The rule covers discovery and chat on any port, applies to *private* networks only, and survives `lazy-chat update` (the program keeps its path). It also removes "block" rules left behind by a dismissed *Allow access?* dialog, which would otherwise override it. If your network is classified as *Public*, the app says so: rules for private networks do not apply there. Do it again at any time with `/firewall` or `lazy-chat firewall`; check with `lazy-chat firewall --status`; undo with `lazy-chat firewall --remove`.
+- **Linux**: if `ufw` or `firewalld` is active, the app prints the exact command to run (for example `sudo ufw allow 8080/tcp && sudo ufw allow 9999:10008/udp`). Hand-written iptables/nftables rules cannot be read without root; open the same ports there.
+- **macOS**: the system itself asks whether lazy-chat may accept incoming connections; choose *Allow*. If you denied it, `lazy-chat firewall` shows the command that reverses it.
+
+### Finding each other
+
+Peers announce themselves every few seconds on every local network (each adapter's subnet broadcast as well as `255.255.255.255`, because Windows sends the latter out of a single adapter, often a WSL, Hyper-V or VPN one). Once you have been connected to a peer, its address is **remembered** and it is reconnected at every start and every two minutes, so after the first meeting you never need its address again, even on networks where broadcasts do not get through. Reconnection is pinned to the remembered peer ID: another machine that later takes the same address is refused. `/forget <peer>` removes one; `--remember-peers=false` turns this off. The addresses are kept in the local database (like the rest of your metadata, see [What is not protected](#security)).
+
 ### When peers don't appear
 
 A peer ID is a fingerprint of a key, not an address, so the app can only reach peers it has *discovered* (the UDP announcements shown in `/list`). Commands naming a peer that was never discovered fail with `peer not found`, followed by a hint.
@@ -299,7 +314,7 @@ or at start-up (`--peer 192.168.1.20`, or `"peers": ["192.168.1.20"]` in the con
 
 ### Other problems
 
-- **Peers don't appear**: allow UDP ports 9999-10008 and your TCP port through the firewall, make sure both machines are on the same subnet, and try `--broadcast-addr` with the subnet broadcast address.
+- **Peers don't appear**: run `/firewall` (or `lazy-chat firewall`) on *both* machines, make sure both are on the same network and that it is classified as *Private* on Windows, then connect once by address (`/connect <ip>`); after that they find each other automatically. Some networks (guest Wi-Fi with client isolation, many corporate networks) block devices from talking to each other at all; nothing on the two computers can fix that.
 - **Address already in use**: pick another `--port`; discovery automatically takes the next free UDP port in its range.
 - **`could not store the key in the OS keychain` / `timed out waiting for the OS keychain`**: the keychain is locked or unavailable (a Linux session without a running Secret Service, an SSH session on macOS). Unlock it, or use `--encryption passphrase`.
 - **`key is not in the OS keychain`**: the data directory was created under another account or machine, or the keychain entry was removed.
@@ -338,6 +353,8 @@ On Windows this has been confirmed by eye as well as by exit status. On macOS an
 - [x] Hiding the sender from relays (sealed sender)
 - [x] macOS Keychain and Linux Secret Service key storage
 - [x] One-command install (Linux, macOS, Windows), signed releases and verified `lazy-chat update`
+- [x] Built-in firewall setup, discovery on every network adapter, remembered peers
+- [ ] Optional relay server for networks that block devices from reaching each other
 - [ ] Web interface
 
 ## License
