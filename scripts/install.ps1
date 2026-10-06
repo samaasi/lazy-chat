@@ -15,6 +15,7 @@
 #   LAZYCHAT_KEY_URL      where to fetch the release public key
 #   LAZYCHAT_ALLOW_UNSIGNED=1  install even though the signature cannot be checked
 #   LAZYCHAT_NO_PATH=1    do not modify PATH
+#   LAZYCHAT_NO_FIREWALL=1  do not offer to allow lazy-chat through Windows Firewall
 
 & {
     $ErrorActionPreference = 'Stop'
@@ -170,6 +171,13 @@
                 $env:Path = "$env:Path;$dir"
                 Write-Host "Added $dir to your PATH (open a new terminal for it to take effect elsewhere)."
             }
+        }
+        # Other peers can only find and reach this computer if Windows Firewall
+        # lets them in. Ask once now (one administrator prompt) instead of at
+        # first use. Never fatal: the app offers it again with /firewall.
+        if ((Env 'LAZYCHAT_NO_FIREWALL' '') -ne '1') {
+            Write-Host 'Allowing lazy-chat through Windows Firewall on private networks (you will see one administrator prompt)...'
+            try { & $dest firewall } catch { Write-Host "Skipped: $_ (run 'lazy-chat firewall' later)" }
         }
         Write-Host "Run 'lazy-chat --help' to get started. Update later with 'lazy-chat update'."
     } finally {

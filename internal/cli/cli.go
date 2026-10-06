@@ -18,6 +18,7 @@ import (
 	"github.com/samaasi/lazy-chat/internal/address"
 	apperrors "github.com/samaasi/lazy-chat/internal/errors"
 	"github.com/samaasi/lazy-chat/internal/filetransfer"
+	"github.com/samaasi/lazy-chat/internal/firewall"
 	"github.com/samaasi/lazy-chat/internal/identity"
 	"github.com/samaasi/lazy-chat/internal/interfaces"
 	"github.com/samaasi/lazy-chat/internal/messaging"
@@ -46,6 +47,7 @@ type Deps struct {
 	Peers     interfaces.PeerManager
 	Net       interfaces.NetworkManager
 	Dialer    AddressDialer
+	Firewall  FirewallGuard
 	Handler   *messaging.Handler
 	Groups    *services.GroupService
 	History   *services.MessageHistoryService
@@ -59,6 +61,12 @@ type Deps struct {
 // AddressDialer connects to a peer at a given address, without discovery.
 type AddressDialer interface {
 	ConnectToAddress(ctx context.Context, t address.Target) (peerID, name string, err error)
+}
+
+// FirewallGuard checks and opens the system firewall for this program.
+type FirewallGuard interface {
+	Check(ctx context.Context) firewall.Report
+	Allow(ctx context.Context) error
 }
 
 // RelayInfo reports what this peer holds for others.
@@ -241,6 +249,7 @@ func (c *CLI) buildCommands() []command {
 		{[]string{"/search"}, "<text>", "Search message history", c.cmdSearch},
 		{[]string{"/export"}, "<peer|group> <file> [text|json]", "Export a conversation to a new file", c.cmdExport},
 		{[]string{"/relay"}, "", "Show messages held for offline peers", c.cmdRelay},
+		{[]string{"/firewall"}, "", "Let other peers find and reach you through the firewall", c.cmdFirewall},
 		{[]string{"/status", "/st"}, "", "Show application status", c.cmdStatus},
 		{[]string{"/quit", "/exit", "/q"}, "", "Exit", func(context.Context, string) error {
 			c.Console.Printf("Goodbye!")
@@ -558,6 +567,46 @@ func (c *CLI) cmdConnections(ctx context.Context, _ string) error {
 	c.Console.Printf("Active connections (%d), all encrypted and authenticated:", len(ids))
 	c.table("NAME\tID\tADDRESS\tTRUST", rows)
 	return nil
+}
+
+func (c *CLI) cmdFirewall(ctx context.Context, _ string) error {
+	if c.Firewall == nil {
+		return errors.New("firewall control is not available")
+	}
+	c.Console.Printf("Checking the firewall...")
+	r := c.Firewall.Check(ctx)
+	if r.Status == firewall.Open {
+		c.Console.Printf("Nothing to do: other peers can reach you.")
+		c.printLines(r.Advice) // e.g. a Public network
+		return nil
+	}
+	switch err := c.Firewall.Allow(ctx); {
+	case err == nil:
+		c.Console.Printf("Done: lazy-chat is allowed on private networks.")
+		if r.PublicNetwork {
+			c.printLines(r.Advice)
+		}
+		return nil
+	case errors.Is(err, firewall.ErrManual):
+		if r.Advice == "" {
+			c.Console.Printf("No active firewall was found that lazy-chat could open.")
+			return nil
+		}
+		c.printLines(r.Advice)
+		return nil
+	case errors.Is(err, firewall.ErrDeclined):
+		return errors.New("the administrator prompt was declined; nothing was changed")
+	default:
+		return fmt.Errorf("could not change the firewall: %w", err)
+	}
+}
+
+func (c *CLI) printLines(text string) {
+	for _, l := range strings.Split(text, "\n") {
+		if l != "" {
+			c.Console.Printf("%s", l)
+		}
+	}
 }
 
 func (c *CLI) cmdRelay(ctx context.Context, _ string) error {

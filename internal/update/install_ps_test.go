@@ -33,7 +33,8 @@ func runPowerShell(t *testing.T, srv *httptest.Server, dir string, extra ...stri
 		"LAZYCHAT_BASE_URL="+srv.URL,
 		"LAZYCHAT_KEY_URL="+srv.URL+"/key.pub",
 		"LAZYCHAT_INSTALL_DIR="+dir,
-		"LAZYCHAT_NO_PATH=1", // never touch the real user PATH from a test
+		"LAZYCHAT_NO_PATH=1",     // never touch the real user PATH from a test
+		"LAZYCHAT_NO_FIREWALL=1", // nor the real firewall (the fake program could not run anyway)
 	)
 	cmd.Env = append(cmd.Env, extra...)
 	out, err := cmd.CombinedOutput()
@@ -123,4 +124,25 @@ func TestInstallPowerShellScript(t *testing.T) {
 			t.Fatalf("accepted:\n%s", out)
 		}
 	})
+}
+
+// The firewall step must never break an installation: here the installed
+// "program" cannot even run, and the install still succeeds.
+func TestInstallPowerShellFirewallStepIsNeverFatal(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("windows only")
+	}
+	if _, err := exec.LookPath("powershell.exe"); err != nil {
+		t.Skip("no powershell")
+	}
+	f := newFakeRelease(t, "v1.4.0", []byte("unused"))
+	srv := serveInstallRelease(t, f, "windows", map[string]string{"amd64": "amd64", "arm64": "arm64"}[runtime.GOARCH])
+	dir := t.TempDir()
+	out, err := runPowerShell(t, srv, dir, "LAZYCHAT_NO_FIREWALL=")
+	if err != nil {
+		t.Fatalf("the install failed because of the firewall step: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "Windows Firewall") || !strings.Contains(out, "Installed:") {
+		t.Fatalf("output:\n%s", out)
+	}
 }

@@ -19,6 +19,7 @@ import (
 	"github.com/samaasi/lazy-chat/internal/discovery"
 	apperrors "github.com/samaasi/lazy-chat/internal/errors"
 	"github.com/samaasi/lazy-chat/internal/filetransfer"
+	"github.com/samaasi/lazy-chat/internal/firewall"
 	"github.com/samaasi/lazy-chat/internal/identity"
 	"github.com/samaasi/lazy-chat/internal/interfaces"
 	"github.com/samaasi/lazy-chat/internal/logger"
@@ -51,6 +52,9 @@ type options struct {
 
 	updateNotice func(ctx context.Context) string
 	passphrase   string
+
+	firewall       *firewall.Guard
+	firewallRemind bool
 }
 
 // WithIO sets the CLI's input and output.
@@ -72,6 +76,13 @@ func WithUpdateNotice(fn func(ctx context.Context) string) Option {
 	return func(o *options) { o.updateNotice = fn }
 }
 
+// WithFirewall lets the app report a firewall that keeps peers out, and gives
+// the CLI its /firewall command. remind is false when the user was just asked
+// at start-up, so they are not told twice.
+func WithFirewall(g *firewall.Guard, remind bool) Option {
+	return func(o *options) { o.firewall, o.firewallRemind = g, remind }
+}
+
 // App represents the main application
 type App struct {
 	config *config.Config
@@ -79,6 +90,9 @@ type App struct {
 
 	version      string
 	updateNotice func(ctx context.Context) string
+
+	firewall       *firewall.Guard
+	firewallRemind bool
 
 	id *identity.Identity
 
@@ -221,12 +235,16 @@ func New(cfg *config.Config, opts ...Option) (_ *App, err error) {
 		notifier: notifier, db: db, groups: groups, history: history, console: console,
 		discovery: discovery.NewService(discovery.OptionsFromConfig(cfg), id, log, peers),
 		ctx:       ctx, cancel: cancel, version: o.version, updateNotice: o.updateNotice,
+		firewall: o.firewall, firewallRemind: o.firewallRemind,
 	}
 	a.cli = cli.New(cli.Deps{
 		In: o.in, Console: console, SelfID: id.ID(), SelfName: cfg.Username,
 		Peers: peers, Net: netMgr, Dialer: netMgr, Handler: handler, Groups: groups, History: history, Files: files, Verify: db, Relay: relayMgr,
 		StartedAt: time.Now(), Version: o.version,
 	})
+	if o.firewall != nil { // never a typed nil in the interface
+		a.cli.Firewall = o.firewall
+	}
 	return a, nil
 }
 
@@ -278,6 +296,10 @@ func (a *App) Start() error {
 		a.wg.Add(1)
 		go a.announceUpdate()
 	}
+	if a.firewall != nil && a.firewallRemind {
+		a.wg.Add(1)
+		go a.checkFirewall()
+	}
 	for _, p := range a.config.Peers {
 		if t, err := address.Parse(p); err == nil { // validated with the configuration
 			a.wg.Add(1)
@@ -320,6 +342,18 @@ func (a *App) connectConfigured(t address.Target) {
 		}
 	}
 	a.console.Printf("* Could not connect to %s: %v", t, last)
+}
+
+// checkFirewall tells the user once if the firewall keeps peers out.
+func (a *App) checkFirewall() {
+	defer a.wg.Done()
+	r := a.firewall.Check(a.ctx)
+	if a.ctx.Err() != nil || r.Advice == "" {
+		return
+	}
+	for _, line := range strings.Split(r.Advice, "\n") {
+		a.console.Printf("* %s", line)
+	}
 }
 
 // announceUpdate tells the user once if a newer release exists.
