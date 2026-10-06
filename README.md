@@ -25,15 +25,30 @@ A peer-to-peer chat for your local network, written in Go. There is no server an
 - **Desktop notifications** (optional) on Windows, macOS and Linux
 - **Single static binary**: pure Go, no C compiler or runtime needed
 
-## Quick start
+## Install
 
-Download a release for your platform from the [Releases](https://github.com/samaasi/lazy-chat/releases) page (`windows-amd64`, `darwin-amd64`, `darwin-arm64`, `linux-amd64`, `linux-arm64`), or build from source (requires **Go 1.27+**):
+One command, no dependencies. Each installer downloads the release for your machine, checks it against the release's SHA-256 checksums (and its signature, see [Updating](#updating)) and installs nothing if a check fails.
+
+| System | Command |
+| --- | --- |
+| **macOS, Linux** | `curl -fsSL https://raw.githubusercontent.com/samaasi/lazy-chat/master/scripts/install.sh \| sh` |
+| **macOS, Linux** (Homebrew) | `brew install samaasi/tap/lazy-chat` |
+| **Windows** (PowerShell) | `irm https://raw.githubusercontent.com/samaasi/lazy-chat/master/scripts/install.ps1 \| iex` |
+| **Windows** (Scoop) | `scoop bucket add samaasi https://github.com/samaasi/scoop-bucket` then `scoop install lazy-chat` |
+| **Go 1.27+** | `go install github.com/samaasi/lazy-chat/cmd/lazy-chat@latest` |
+
+The scripts install to `/usr/local/bin` (or `~/.local/bin` if that is not writable) and `%LOCALAPPDATA%\Programs\lazy-chat` (added to your user `PATH`; no administrator rights needed). Set `LAZYCHAT_VERSION=v1.2.3` to pin a version and `LAZYCHAT_INSTALL_DIR` to choose the folder. You can also download an archive from the [Releases](https://github.com/samaasi/lazy-chat/releases) page (Linux, macOS and Windows; amd64 and arm64) or build from source:
 
 ```bash
 git clone https://github.com/samaasi/lazy-chat.git
 cd lazy-chat
-go build -o lazy-chat ./cmd
-./lazy-chat --username Alice
+go build -o lazy-chat ./cmd/lazy-chat
+```
+
+## Quick start
+
+```bash
+lazy-chat --username Alice
 ```
 
 On the first run:
@@ -51,8 +66,8 @@ Start it on two machines on the same network and they find each other:
 Trying it on one machine? Give each instance its own port and data directory:
 
 ```bash
-./lazy-chat -u Alice -p 8080 --data-dir /tmp/alice
-./lazy-chat -u Bob   -p 8081 --data-dir /tmp/bob
+lazy-chat -u Alice -p 8080 --data-dir /tmp/alice
+lazy-chat -u Bob   -p 8081 --data-dir /tmp/bob
 ```
 
 ## Commands
@@ -103,6 +118,7 @@ The config file is `./config.json` if present, or the path given with `-c/--conf
 | `--relay` / `relay` | on | Hold encrypted messages for offline peers (`--relay=false` to opt out) |
 | `--relay-max-storage` / `relay_max_storage` | `67108864` | Most bytes of other peers' messages to hold |
 | `--sealed-sender` / `sealed_sender` | `auto` | `auto` queues offline messages even if a relay could see you sent them (you are told); `required` only queues them anonymously |
+| `--update-check` / `update_check` | on | Look for a new release once a day and say so (`--update-check=false` to disable; see [Updating](#updating)) |
 | `--download-dir` / `download_dir` | `downloads` | Where received files go |
 | `--max-file-size` / `max_file_size` | `268435456` | Largest incoming file, bytes |
 | `--auto-accept-files` / `auto_accept_files` | off | Accept incoming files without asking |
@@ -182,6 +198,26 @@ Forward secrecy for offline messages comes from deleting keys. Each message uses
 - *Trust on first use.* Until you compare safety numbers, you trust that the ID you see belongs to the person you think it does.
 - Chat is for trusted local networks. Do not expose the TCP port to the internet.
 
+## Updating
+
+```bash
+lazy-chat update            # download, verify and install the latest release
+lazy-chat update --check    # only say whether there is one
+```
+
+`lazy-chat update` never runs by itself. At start-up the program checks GitHub once a day and prints a line if a newer release exists; that is the only network request it makes outside your LAN, it sends nothing but a standard HTTPS request for the public release information, and `--update-check=false` turns it off.
+
+The update is accepted only if it is authentic:
+
+1. Every release carries `checksums.txt` and `checksums.txt.sig`, a [cosign](https://github.com/sigstore/cosign) signature made in CI with a private key that is not stored in the repository.
+2. The matching public key is compiled into the program ([internal/update/release.pub](internal/update/release.pub)). The signature is checked first; the download host and the network in between are not trusted.
+3. The archive must match its signed checksum. Then the new program is started once with `--version` and must report the expected version.
+4. Only then does it replace the old one, atomically (Windows renames the running program aside), and downgrades are refused.
+
+If anything fails, your installed copy is left exactly as it was. Copies installed by Homebrew, Scoop or `go install` are not replaced behind their manager's back; the command tells you what to run instead (or pass `--force`). A program built from source has no signing key and can look for updates but not install them. Maintainers: see [RELEASING.md](RELEASING.md).
+
+The install scripts apply the same checks (the signature check needs `openssl` on macOS and Linux, which is normally present; without it they say so and rely on the checksum alone).
+
 ## Data and files
 
 | What | Where |
@@ -233,15 +269,15 @@ Wire format: frames are `kind (1 byte) | length (4 bytes) | body`. Control frame
 go vet ./...
 go test ./...                 # all packages
 go test -race ./...           # needs cgo (a C compiler); CI runs it
-CGO_ENABLED=0 go build ./cmd  # the release configuration
+CGO_ENABLED=0 go build ./cmd/lazy-chat  # the release configuration
 ```
 
-The suite includes end-to-end tests that start complete applications on loopback (real TLS, discovery and SQLite) and drive them through their CLIs, and tests that scan the raw database files for plaintext. CI builds all five release targets, runs `go vet`, tests with and without the race detector on Linux, Windows and macOS, and scans for known vulnerabilities with `govulncheck`.
+The suite includes end-to-end tests that start complete applications on loopback (real TLS, discovery and SQLite) and drive them through their CLIs, and tests that scan the raw database files for plaintext. CI builds every release archive as a dry run (GoReleaser snapshot), runs `go vet`, tests with and without the race detector on Linux, Windows and macOS, and scans for known vulnerabilities with `govulncheck`.
 
 Cross-compiling needs no toolchain beyond Go:
 
 ```bash
-GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o lazy-chat-linux-arm64 ./cmd
+GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o lazy-chat-linux-arm64 ./cmd/lazy-chat
 ```
 
 ## Troubleshooting
@@ -257,6 +293,18 @@ GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o lazy-chat-linux-arm64 ./cmd
 - **Messages show "(not delivered)"**: the peer was unreachable. If you were connected to anyone who could hold it, it is queued with relays ("queued with relays") and will arrive when they return; otherwise it is retried automatically when you next reach them or a relay. It changes to delivered only when the recipient's signed receipt arrives.
 - **"saved but not delivered" when writing to an offline peer**: you have never met them (no prekey bundle) and nobody connected to you holds one, or none of your connected peers is willing to hold messages. Connect to a peer who knows them, or wait until they are online.
 - **No notifications**: enable with `--notifications`; Linux needs `notify-send` (libnotify).
+- **`update` says "no release signing key"**: this copy was built from source. Install a release to get verified updates.
+- **`update` cannot write**: the program is in a folder you do not own; re-run with `sudo`, or install somewhere you do.
+
+### Testing notifications
+
+The unit tests check what is handed to the operating system (hostile text never reaches a script, flooding is bounded) without showing anything. To see real notifications and require the OS helper to accept them:
+
+```bash
+LAZYCHAT_TEST_NOTIFY=1 go test ./internal/notification -run Real -v
+```
+
+On Windows this has been confirmed by eye as well as by exit status. On macOS and Linux it checks that the helper (`osascript`, `notify-send`) exits successfully; it needs a desktop session and, on Linux, a notification daemon.
 
 ## Roadmap
 
@@ -272,6 +320,7 @@ GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o lazy-chat-linux-arm64 ./cmd
 - [ ] Re-queueing of group messages to offline members after the first attempt
 - [x] Hiding the sender from relays (sealed sender)
 - [x] macOS Keychain and Linux Secret Service key storage
+- [x] One-command install (Linux, macOS, Windows), signed releases and verified `lazy-chat update`
 - [ ] Web interface
 
 ## License
