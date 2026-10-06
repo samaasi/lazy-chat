@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/samaasi/lazy-chat/internal/address"
 	"github.com/samaasi/lazy-chat/internal/cli"
 	"github.com/samaasi/lazy-chat/internal/config"
 	"github.com/samaasi/lazy-chat/internal/discovery"
@@ -223,7 +224,7 @@ func New(cfg *config.Config, opts ...Option) (_ *App, err error) {
 	}
 	a.cli = cli.New(cli.Deps{
 		In: o.in, Console: console, SelfID: id.ID(), SelfName: cfg.Username,
-		Peers: peers, Net: netMgr, Handler: handler, Groups: groups, History: history, Files: files, Verify: db, Relay: relayMgr,
+		Peers: peers, Net: netMgr, Dialer: netMgr, Handler: handler, Groups: groups, History: history, Files: files, Verify: db, Relay: relayMgr,
 		StartedAt: time.Now(), Version: o.version,
 	})
 	return a, nil
@@ -277,7 +278,42 @@ func (a *App) Start() error {
 		a.wg.Add(1)
 		go a.announceUpdate()
 	}
+	for _, p := range a.config.Peers {
+		if t, err := address.Parse(p); err == nil { // validated with the configuration
+			a.wg.Add(1)
+			go a.connectConfigured(t)
+		}
+	}
 	return nil
+}
+
+// connectBackoff spaces out the attempts to reach a configured address, which
+// may simply not be running yet.
+var connectBackoff = []time.Duration{0, 2 * time.Second, 5 * time.Second, 10 * time.Second, 30 * time.Second, time.Minute}
+
+// connectConfigured dials an address given with --peer, retrying for a while.
+func (a *App) connectConfigured(t address.Target) {
+	defer a.wg.Done()
+	var last error
+	for _, wait := range connectBackoff {
+		select {
+		case <-a.ctx.Done():
+			return
+		case <-time.After(wait):
+		}
+		ctx, cancel := context.WithTimeout(a.ctx, 20*time.Second)
+		id, _, err := a.netMgr.ConnectToAddress(ctx, t)
+		cancel()
+		if err == nil || errors.Is(err, apperrors.ErrPeerAlreadyConnected) {
+			if err == nil && t.ID == "" {
+				a.console.Printf("* Connected to %s by address; confirm who it is with /safety %s", t, id[:8])
+			}
+			return
+		}
+		last = err
+		a.logger.Debug("Could not reach configured peer", "address", t.String(), "error", err)
+	}
+	a.console.Printf("* Could not connect to %s: %v", t, last)
 }
 
 // announceUpdate tells the user once if a newer release exists.

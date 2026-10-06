@@ -15,6 +15,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/samaasi/lazy-chat/internal/address"
 	apperrors "github.com/samaasi/lazy-chat/internal/errors"
 	"github.com/samaasi/lazy-chat/internal/filetransfer"
 	"github.com/samaasi/lazy-chat/internal/identity"
@@ -44,6 +45,7 @@ type Deps struct {
 	SelfName  string
 	Peers     interfaces.PeerManager
 	Net       interfaces.NetworkManager
+	Dialer    AddressDialer
 	Handler   *messaging.Handler
 	Groups    *services.GroupService
 	History   *services.MessageHistoryService
@@ -52,6 +54,11 @@ type Deps struct {
 	Relay     RelayInfo
 	StartedAt time.Time
 	Version   string
+}
+
+// AddressDialer connects to a peer at a given address, without discovery.
+type AddressDialer interface {
+	ConnectToAddress(ctx context.Context, t address.Target) (peerID, name string, err error)
 }
 
 // RelayInfo reports what this peer holds for others.
@@ -129,6 +136,9 @@ func (c *CLI) Start(ctx context.Context) error {
 					return nil
 				}
 				c.Console.Printf("Error: %v", err)
+				if errors.Is(err, apperrors.ErrPeerNotFound) {
+					c.Console.Printf("  %s", notDiscoveredHint)
+				}
 			}
 		}
 	}
@@ -206,7 +216,7 @@ func (c *CLI) buildCommands() []command {
 		{[]string{"/safety"}, "<peer>", "Show the safety number to compare with a peer", c.cmdSafety},
 		{[]string{"/verify"}, "<peer>", "Mark a peer as verified after comparing safety numbers", c.cmdVerify},
 		{[]string{"/unverify"}, "<peer>", "Remove a peer's verified mark", c.cmdUnverify},
-		{[]string{"/connect", "/c"}, "<peer>", "Connect to a peer", c.cmdConnect},
+		{[]string{"/connect", "/c"}, "<peer | [id@]host[:port]>", "Connect to a peer, by name or by address", c.cmdConnect},
 		{[]string{"/disconnect"}, "<peer>", "Close the connection to a peer", c.cmdDisconnect},
 		{[]string{"/connections", "/conn"}, "", "List active connections", c.cmdConnections},
 		{[]string{"/send", "/s"}, "<peer> <message>", "Send a message", c.cmdSend},
@@ -458,9 +468,17 @@ func (c *CLI) cmdList(ctx context.Context, _ string) error {
 	return nil
 }
 
+// notDiscoveredHint explains the usual reasons a peer cannot be found.
+const notDiscoveredHint = "That peer has not been discovered on this network (see /list). Both must be on the same network, " +
+	"and the firewall must allow UDP 9999-10008 and the chat's TCP port. " +
+	"If broadcasts do not get through, connect by address: /connect <ip>[:port]"
+
 func (c *CLI) cmdConnect(ctx context.Context, arg string) error {
 	if arg == "" {
 		return errUsage
+	}
+	if address.LooksLikeAddress(arg) {
+		return c.connectAddress(ctx, arg)
 	}
 	id, err := c.resolvePeer(arg)
 	if err != nil {
@@ -475,6 +493,34 @@ func (c *CLI) cmdConnect(ctx context.Context, arg string) error {
 		return fmt.Errorf("could not connect: %w", err)
 	}
 	return nil // the connection event announces success
+}
+
+// connectAddress dials host[:port] or <id>@host[:port] directly.
+func (c *CLI) connectAddress(ctx context.Context, arg string) error {
+	if c.Dialer == nil {
+		return errors.New("connecting by address is not available")
+	}
+	t, err := address.Parse(arg)
+	if err != nil {
+		return err
+	}
+	c.Console.Printf("Connecting to %s...", t)
+	id, _, err := c.Dialer.ConnectToAddress(ctx, t)
+	if errors.Is(err, apperrors.ErrPeerAlreadyConnected) {
+		c.Console.Printf("Already connected to %s", c.name(id))
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("could not connect: %w", err)
+	}
+	// The connection event announces success. Without an expected ID, nobody
+	// vouched for who answered at that address.
+	if t.ID == "" {
+		if _, ok := c.verifiedSet(ctx)[id]; !ok {
+			c.Console.Printf("  You connected by address without an ID to check, so confirm who this is: /safety %s", id[:8])
+		}
+	}
+	return nil
 }
 
 func (c *CLI) cmdDisconnect(_ context.Context, arg string) error {
