@@ -255,13 +255,18 @@ func TestReplayedAnnouncementDoesNotMoveAPeer(t *testing.T) {
 
 func TestSourceRateLimit(t *testing.T) {
 	s := newSvc(t, "alice", randomBase(), func(o *Options) { o.Interval = time.Hour })
-	// One source address hammering with many valid identities (Sybil flood).
-	for i := range 200 {
+
+	// Sign everything first: the limiter refills with wall-clock time, so the
+	// flood itself must be delivered faster than a token can be earned.
+	packets := make([][]byte, 200)
+	for i := range packets {
 		id, _ := identity.Generate()
-		_ = i
-		inject(s, sign(id, nil), "10.5.5.5")
+		packets[i] = sign(id, nil)
 	}
-	if n := s.peers.Count(); n > sourceBurst+2 {
+	for _, pkt := range packets { // one source address, many valid identities (a Sybil flood)
+		inject(s, pkt, "10.5.5.5")
+	}
+	if n := s.peers.Count(); n > sourceBurst+1 {
 		t.Fatalf("one source registered %d peers; rate limit burst is %d", n, sourceBurst)
 	}
 	// A different source is unaffected.
