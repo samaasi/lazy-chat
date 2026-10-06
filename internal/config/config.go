@@ -14,6 +14,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/samaasi/lazy-chat/internal/address"
 	apperrors "github.com/samaasi/lazy-chat/internal/errors"
 )
 
@@ -43,6 +44,7 @@ type Config struct {
 	Relay                bool            `json:"relay"`             // hold encrypted messages for offline peers
 	RelayMaxStorage      int64           `json:"relay_max_storage"` // bytes of other peers' messages held at most
 	SealedSender         string          `json:"sealed_sender"`     // auto or required: hide who queues a message from relays
+	Peers                []string        `json:"peers"`             // addresses to connect to at start-up, for networks where discovery does not reach: host[:port] or <peer id>@host[:port]
 	UpdateCheck          bool            `json:"update_check"`      // tell me at start-up when a new release exists (never installs it)
 	DownloadDir          string          `json:"download_dir"`
 	MaxFileSize          int64           `json:"max_file_size"`     // bytes accepted per incoming file
@@ -204,6 +206,15 @@ func (c *Config) loadFromEnv(getenv func(string) string) error {
 		{"P2P_DB_PATH", &c.Database.Path},
 	}
 
+	if v := getenv("P2P_PEERS"); v != "" {
+		c.Peers = nil
+		for _, p := range strings.Split(v, ",") {
+			if p = strings.TrimSpace(p); p != "" {
+				c.Peers = append(c.Peers, p)
+			}
+		}
+	}
+
 	for _, b := range bindings {
 		value := getenv(b.name)
 		if value == "" {
@@ -262,6 +273,10 @@ func (c *Config) loadFromFlags(args []string) error {
 	str(&c.PassphraseFile, "passphrase-file", "File containing the passphrase")
 	fs.BoolVar(&c.Relay, "relay", c.Relay, "Hold encrypted messages for offline peers (--relay=false to disable)")
 	fs.Int64Var(&c.RelayMaxStorage, "relay-max-storage", c.RelayMaxStorage, "Most bytes of other peers' messages to hold")
+	fs.Func("peer", "Connect to this address at start-up: host[:port] or <peer id>@host[:port] (repeatable)", func(v string) error {
+		c.Peers = append(c.Peers, v)
+		return nil
+	})
 	fs.BoolVar(&c.UpdateCheck, "update-check", c.UpdateCheck, "Check GitHub once a day for a new release and say so (--update-check=false to disable)")
 	fs.StringVar(&c.SealedSender, "sealed-sender", c.SealedSender, "Offline delivery privacy: auto or required")
 	str(&c.DownloadDir, "download-dir", "Directory for downloaded files")
@@ -300,6 +315,8 @@ Options:
       --passphrase-file <file>  Read the passphrase from this file instead of asking
       --relay=false             Do not hold encrypted messages for offline peers (default on)
       --relay-max-storage <n>   Most bytes of other peers' messages to hold (default 67108864)
+      --peer <address>          Connect to host[:port] or <peer id>@host[:port] at start-up, when
+                                discovery cannot reach it; repeat for several (config: "peers")
       --update-check=false      Do not look for new releases at start-up (default on, once a day)
       --sealed-sender <mode>    auto: queue offline messages even when a relay can see you are the sender
                                 (you are told); required: only queue them anonymously (default auto)
@@ -372,6 +389,11 @@ func (c *Config) Validate() error {
 	}
 	if c.RelayMaxStorage < 1<<20 || c.RelayMaxStorage > 64<<30 {
 		return invalid("relay_max_storage", c.RelayMaxStorage, "must be between 1 MiB and 64 GiB")
+	}
+	for _, p := range c.Peers {
+		if _, err := address.Parse(p); err != nil {
+			return invalid("peers", p, err.Error())
+		}
 	}
 	switch c.SealedSender = strings.ToLower(c.SealedSender); c.SealedSender {
 	case "auto", "required":

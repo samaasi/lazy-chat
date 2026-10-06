@@ -17,6 +17,7 @@
   "relay_max_storage": 67108864,
   "sealed_sender": "auto",
   "update_check": true,
+  "peers": [],
   "download_dir": "downloads",
   "max_file_size": 268435456,
   "auto_accept_files": false
