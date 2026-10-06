@@ -25,3 +25,18 @@ go.work.sum
 # env file
 .env
 
+
+# Local runtime data
+logs/
+downloads/
+test-downloads/
+*.db
+*.db-shm
+*.db-wal
+config.json
+identity.key
+
+# IDE
+.idea/
+*.iml
+.vscode/
