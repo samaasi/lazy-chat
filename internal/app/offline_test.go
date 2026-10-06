@@ -255,3 +255,65 @@ func TestRelayConfigIsValidated(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// With a third peer to forward for her, Alice's offline message is queued
+// without any relay seeing who sent it, and she is not warned.
+func TestOfflineMessageIsQueuedAnonymouslyWhenAForwarderExists(t *testing.T) {
+	base := randomBase()
+	alice, bob := newInstance(t, "alice", base), newInstance(t, "bob", base)
+	carol, yan := newInstance(t, "carol", base), newInstance(t, "yan", base)
+	for _, p := range [][2]*instance{{alice, bob}, {alice, carol}, {alice, yan}, {yan, carol}} {
+		waitDiscovered(t, p[0], p[1])
+	}
+	alice.say("/send bob hello")
+	bob.waitOut("hello")
+	waitBundle(t, alice, bob)
+	bob.app.Stop()
+	connected(t, alice, carol)
+	connected(t, alice, yan)
+	connected(t, yan, carol)
+
+	alice.say("/send bob in a sealed envelope")
+	alice.waitOut("queued with relays")
+	if strings.Contains(alice.out.String(), "could see that this is from you") {
+		t.Fatalf("Alice was warned although forwarders were available:\n%s", alice.out.String())
+	}
+	relayHolds(t, carol, 1)
+	relayHolds(t, yan, 1)
+}
+
+// Alone with a single relay the sender is visible to it, and the app says so;
+// with sealed_sender=required it refuses to queue at all.
+func TestSealedSenderPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		policy string
+		queued bool
+	}{{"auto", true}, {"required", false}} {
+		t.Run(tc.policy, func(t *testing.T) {
+			alice, bob, carol := trio(t, func(c *config.Config) { c.SealedSender = tc.policy })
+			alice.say("/send bob hello")
+			bob.waitOut("hello")
+			waitBundle(t, alice, bob)
+			bob.app.Stop()
+			connected(t, alice, carol)
+
+			alice.say("/send bob only one relay is reachable")
+			if tc.queued {
+				alice.waitOut("queued with relays", "could see that this is from you")
+				relayHolds(t, carol, 1)
+			} else {
+				alice.waitOut("saved but not delivered")
+				relayHolds(t, carol, 0)
+			}
+		})
+	}
+}
+
+func TestSealedSenderConfigIsValidated(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Database.Path = "chat.db"
+	cfg.SealedSender = "sometimes"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("an unknown sealed_sender mode was accepted")
+	}
+}

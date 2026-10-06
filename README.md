@@ -17,7 +17,7 @@ A peer-to-peer chat for your local network, written in Go. There is no server an
 ## Features
 
 - **Direct messages and groups**, with delivery receipts, searchable and exportable history, and automatic retry of anything that could not be delivered
-- **Offline delivery**: write to someone who is not online and the message is end-to-end encrypted to them and held by other peers until they return, even if you are offline by then too. You get a signed receipt when it arrives.
+- **Offline delivery**: write to someone who is not online and the message is end-to-end encrypted to them and held by other peers until they return, even if you are offline by then too. The peers holding it do not learn who sent it. You get a signed receipt when it arrives.
 - **Automatic discovery** of peers on the LAN (signed UDP broadcasts)
 - **Layered encryption**: TLS 1.3 between peers, a Double Ratchet on top for per-message forward secrecy, and encryption at rest for your database and private key
 - **Verifiable identities**: every peer is its own key; compare *safety numbers* to be sure you are talking to the right person
@@ -102,6 +102,7 @@ The config file is `./config.json` if present, or the path given with `-c/--conf
 | `--passphrase-file` / `passphrase_file` | none | File whose first line is the passphrase |
 | `--relay` / `relay` | on | Hold encrypted messages for offline peers (`--relay=false` to opt out) |
 | `--relay-max-storage` / `relay_max_storage` | `67108864` | Most bytes of other peers' messages to hold |
+| `--sealed-sender` / `sealed_sender` | `auto` | `auto` queues offline messages even if a relay could see you sent them (you are told); `required` only queues them anonymously |
 | `--download-dir` / `download_dir` | `downloads` | Where received files go |
 | `--max-file-size` / `max_file_size` | `268435456` | Largest incoming file, bytes |
 | `--auto-accept-files` / `auto_accept_files` | off | Accept incoming files without asking |
@@ -146,23 +147,32 @@ Beyond that:
 
 ### Offline delivery and relays
 
-When you write to someone who is offline, your app encrypts the message to the recipient's *prekeys*, hands the ciphertext to a few of the peers you are connected to (**relays**), and keeps the message marked "not delivered". When the recipient next connects to any of those relays they receive it, store it like any other message, and send back a **receipt signed with their identity key**. The relay passes the receipt on to you, even if you were offline when the message was delivered, and only then does the message show as delivered.
+When you write to someone who is offline, your app encrypts the message to the recipient's *prekeys*, hands the ciphertext to a few of the peers you are connected to (**relays**), and keeps the message marked "not delivered". When the recipient next connects to any of those relays they receive it, store it like any other message, and send back a **receipt signed with their identity key**. The relay keeps the receipt for you, even if you were offline when the message was delivered, and you collect it later; only then does the message show as delivered.
 
 Peers exchange prekey bundles whenever they connect, so you can write to anyone you have met once, or whose bundle a mutual peer already holds (it asks on your behalf). The bundle is signed by the owner's identity key, so whoever relays it cannot swap in their own.
 
+**Sealed sender.** A relay does not learn who wrote a message. The sender's identity is inside the end-to-end encryption, and the request to hold it is sealed to the relay and carried by a second peer you are connected to (a *forwarder*): the relay sees only the forwarder, and the forwarder sees only a sealed blob and which relay it is for, never the recipient or the text. Neither can link you to the recipient. Receipts are filed under a random mailbox tag known only to you and the recipient, and you collect them through a forwarder too.
+
 | A relay | |
 | --- | --- |
-| **can see** | who a message is from and for, when it was stored, and roughly how big it is |
-| **cannot** | read it, alter it, forge a receipt, or pretend to be the sender |
+| **can see** | who a message is *for*, when it was stored, and roughly how big it is |
+| **cannot** | read it, alter it, forge a receipt, pretend to be the sender, or tell who sent it |
 | **can** | delay or drop it, which is why senders use several relays and keep retrying direct delivery |
 
-Relays are bounded: total storage (`--relay-max-storage`), messages and bytes per sender, messages per recipient, a 7-day expiry, and only the addressee can acknowledge or remove a held message. Turn relaying off with `--relay=false`; you can still send through other peers' relays.
+| A forwarder | |
+| --- | --- |
+| **can see** | that you asked it to reach a particular relay, and how big the request was |
+| **cannot** | read the request or its answer, or learn who the message is for |
+
+Hiding the sender needs three peers: you, a forwarder and a relay. With fewer, the request goes straight to the relay, which then sees that it is from you; the app says so ("N relay(s) could see that this is from you"). `--sealed-sender=required` (`sealed_sender`, `P2P_SEALED_SENDER`) refuses instead and keeps the message undelivered until a forwarder is connected. Forwarding is part of relaying, so `--relay=false` turns it off too.
+
+Relays are bounded: total storage (`--relay-max-storage`), messages and bytes per submitter, messages per recipient, a 7-day expiry, and only the addressee can acknowledge or remove a held message. Turn relaying off with `--relay=false`; you can still send through other peers' relays.
 
 Forward secrecy for offline messages comes from deleting keys. Each message uses a fresh ephemeral key plus, when available, a one-time prekey that is reserved for you alone and destroyed the first time it opens a message. If none are left, protection falls back to the weekly-rotated signed prekey, which is deleted after four weeks, so those messages are protected only until then.
 
 **What is not protected**
 
-- *Metadata.* Peer IDs, timestamps, group IDs and delivery flags stay readable in the database (they are needed to query it), and discovery announcements (username, TCP port) are broadcast in clear text to the whole LAN. Anyone on the network can see *that* you are online, though not what you say. A relay additionally learns who is writing to whom, and when, for the messages it holds.
+- *Metadata.* Peer IDs, timestamps, group IDs and delivery flags stay readable in the database (they are needed to query it), and discovery announcements (username, TCP port) are broadcast in clear text to the whole LAN. Anyone on the network can see *that* you are online, though not what you say. A relay additionally learns who a held message is for, and when; it does not learn who sent it unless you had too few peers connected to use a forwarder (see sealed sender).
 - *Received files and exports* are ordinary files and are not encrypted; keep them on an encrypted disk if that matters.
 - *Memory.* Keys and plaintext exist in process memory while the program runs. The OS keychain protects against another user or a stolen disk, not against malware running as you.
 - *Ratchet scope.* Ratchet sessions live as long as a connection; they are not stored. Retried messages are re-encrypted for the new connection. Offline messages use their own per-message encryption (above) rather than a ratchet, so they have no post-compromise healing.
@@ -260,7 +270,7 @@ GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o lazy-chat-linux-arm64 ./cmd
 - [x] Automatic retry of undelivered direct messages
 - [x] Offline delivery: end-to-end encrypted store-and-forward through relays, with signed receipts
 - [ ] Re-queueing of group messages to offline members after the first attempt
-- [ ] Hiding the sender from relays (sealed sender)
+- [x] Hiding the sender from relays (sealed sender)
 - [x] macOS Keychain and Linux Secret Service key storage
 - [ ] Web interface
 
