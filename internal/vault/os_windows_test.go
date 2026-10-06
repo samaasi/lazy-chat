@@ -43,10 +43,10 @@ func TestDPAPIVaultNeedsNoPassphrase(t *testing.T) {
 }
 
 func TestDPAPIRejectsGarbageBlob(t *testing.T) {
-	if _, err := osUnprotect([]byte("not a dpapi blob")); err == nil {
+	if _, err := dpapiUnprotect([]byte("not a dpapi blob")); err == nil {
 		t.Fatal("garbage unwrapped")
 	}
-	if _, err := osUnprotect(nil); err == nil {
+	if _, err := dpapiUnprotect(nil); err == nil {
 		t.Fatal("empty blob unwrapped")
 	}
 }

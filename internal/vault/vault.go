@@ -9,11 +9,15 @@
 //   - passphrase: wrapped with a key derived from a passphrase using Argon2id.
 //     Works everywhere; the passphrase is asked for at start-up (or read from
 //     --passphrase-file / P2P_PASSPHRASE for unattended use).
-//   - os: wrapped with the operating system's per-user protection (Windows
-//     DPAPI). Seamless - nothing to type - and bound to the user account.
+//   - os: protected by the operating system, so there is nothing to type and
+//     the key is bound to your user account: Windows DPAPI, the macOS Keychain
+//     or the Linux Secret Service (GNOME Keyring, KWallet, ...). With the
+//     keychain backends the key file only holds the data key wrapped by a
+//     random key that lives in the keychain, so a copy of the file alone is
+//     useless.
 //
-// "auto" (the default) uses the OS mode where it exists and the passphrase
-// mode elsewhere. Losing the passphrase means losing the data: there is no
+// "auto" (the default) uses the OS mode where it works and the passphrase
+// mode elsewhere (for example a Linux server with no Secret Service). Losing the passphrase means losing the data: there is no
 // recovery path by design.
 package vault
 
@@ -27,7 +31,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 
 	"golang.org/x/crypto/argon2"
@@ -67,7 +70,7 @@ var (
 	ErrEncryptedData   = errors.New("vault: data in this directory is encrypted, but encryption is switched off")
 	ErrNoPassphrase    = errors.New("vault: a passphrase is required (type it, or use --passphrase-file or " + EnvPassphrase + ")")
 	ErrWeakPassphrase  = errors.New("vault: passphrase is too short")
-	ErrUnsupported     = errors.New("vault: OS-protected keys are not available on this platform; use passphrase mode")
+	ErrUnsupported     = errors.New("vault: OS-protected keys are not available here (no working macOS Keychain / Linux Secret Service); use passphrase mode")
 	ErrCorrupt         = errors.New("vault: key file is damaged")
 	ErrModeMismatch    = errors.New("vault: the existing key file uses a different protection mode")
 )
@@ -134,7 +137,13 @@ type keyFile struct {
 	Version int        `json:"version"`
 	Mode    Mode       `json:"mode"`
 	KDF     *kdfParams `json:"kdf,omitempty"`
-	Wrapped []byte     `json:"wrapped"` // nonce || AES-GCM(data key)
+	Wrapped []byte     `json:"wrapped"` // see below
+
+	// Backend and Account describe ModeOS: how the key is protected and, for
+	// the keychain, under which entry. For DPAPI, Wrapped is the DPAPI blob;
+	// for the keychain it is nonce || AES-GCM(data key) under the keychain's key.
+	Backend string `json:"backend,omitempty"`
+	Account string `json:"account,omitempty"`
 }
 
 // defaultKDF are the Argon2id parameters used for new vaults (OWASP's
@@ -221,6 +230,9 @@ type Options struct {
 	Prompt func(confirm bool) (string, error)
 	// Getenv overrides os.Getenv (and skips unsetting) - for tests.
 	Getenv func(string) string
+	// Keyring overrides the operating system's secret store (tests,
+	// embedding). When set it is used for the os mode on every platform.
+	Keyring Keyring
 }
 
 // Open returns the vault for dataDir, creating the key file on first use.
@@ -248,12 +260,12 @@ func Open(dataDir string, o Options) (*Vault, error) {
 		return nil, fmt.Errorf("create data directory: %w", err)
 	}
 	if exists {
-		return openExisting(raw, o)
+		return openExisting(raw, dataDir, o)
 	}
-	return create(path, o)
+	return create(path, dataDir, o)
 }
 
-func openExisting(raw []byte, o Options) (*Vault, error) {
+func openExisting(raw []byte, dataDir string, o Options) (*Vault, error) {
 	var kf keyFile
 	if err := json.Unmarshal(raw, &kf); err != nil || kf.Version != fileVersion {
 		return nil, ErrCorrupt
@@ -279,7 +291,7 @@ func openExisting(raw []byte, o Options) (*Vault, error) {
 		}
 		dataKey, err = unwrapKey(kek, kf.Wrapped)
 	case ModeOS:
-		dataKey, err = osUnprotect(kf.Wrapped)
+		dataKey, err = unprotectOS(kf, dataDir, o)
 	default:
 		return nil, ErrCorrupt
 	}
@@ -292,12 +304,23 @@ func openExisting(raw []byte, o Options) (*Vault, error) {
 	return New(dataKey)
 }
 
-func create(path string, o Options) (*Vault, error) {
+func create(path, dataDir string, o Options) (*Vault, error) {
 	mode := o.Mode
-	if mode == ModeAuto {
-		mode = ModePassphrase
-		if runtime.GOOS == "windows" {
+	var backend string
+	var kr Keyring
+	switch mode {
+	case ModeAuto:
+		// OS protection where it works, otherwise a passphrase.
+		var err error
+		if backend, kr, err = pickBackend(o); err == nil {
 			mode = ModeOS
+		} else {
+			mode, backend, kr = ModePassphrase, "", nil
+		}
+	case ModeOS:
+		var err error
+		if backend, kr, err = pickBackend(o); err != nil {
+			return nil, err
 		}
 	}
 
@@ -330,19 +353,50 @@ func create(path string, o Options) (*Vault, error) {
 		}
 		kf.KDF = &p
 	case ModeOS:
-		blob, err := osProtect(dataKey)
+		var err error
+		kf.Backend = backend
+		switch backend {
+		case backendDPAPI:
+			kf.Wrapped, err = dpapiProtect(dataKey)
+		case backendKeyring:
+			kf.Account = keyringAccount(dataDir)
+			kf.Wrapped, err = keyringProtect(kr, kf.Account, dataKey)
+		}
 		if err != nil {
 			return nil, err
 		}
-		kf.Wrapped = blob
 	default:
 		return nil, fmt.Errorf("vault: unknown mode %q", o.Mode)
 	}
 
 	if err := writeKeyFile(path, kf); err != nil {
+		// Do not leave a keychain entry behind for a key file that was never written.
+		if kf.Backend == backendKeyring && kr != nil {
+			_ = kr.Delete(keyringService, kf.Account)
+		}
 		return nil, err
 	}
 	return New(dataKey)
+}
+
+// unprotectOS recovers the data key with the backend the key file names.
+func unprotectOS(kf keyFile, dataDir string, o Options) ([]byte, error) {
+	switch kf.Backend {
+	case backendDPAPI, "": // files from before the keychain existed are DPAPI
+		return dpapiUnprotect(kf.Wrapped)
+	case backendKeyring:
+		var kr Keyring = o.Keyring
+		if kr == nil {
+			kr = systemKeyring{}
+		}
+		account := kf.Account
+		if account == "" {
+			account = keyringAccount(dataDir)
+		}
+		return keyringUnprotect(kr, account, kf.Wrapped)
+	default:
+		return nil, ErrCorrupt
+	}
 }
 
 // passphrase finds the passphrase: explicit value, file, environment, prompt.

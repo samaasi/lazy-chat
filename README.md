@@ -114,12 +114,14 @@ If peers cannot see each other, set `--broadcast-addr` to your subnet's broadcas
 
 | Mode | How the data key is protected |
 | --- | --- |
-| `auto` (default) | `os` on Windows, `passphrase` elsewhere |
-| `os` | Windows DPAPI: bound to your Windows account, nothing to type |
+| `auto` (default) | `os` where the operating system's keychain works, otherwise `passphrase` (for example a headless Linux server with no Secret Service) |
+| `os` | The OS keychain, bound to your user account, nothing to type: **Windows** DPAPI, **macOS** Keychain, **Linux** Secret Service (GNOME Keyring, KWallet, ...) |
 | `passphrase` | A key derived from your passphrase with Argon2id |
 | `off` | Nothing is encrypted at rest. Refused if the data is already encrypted |
 
 The passphrase is asked for at start-up. For services and scripts, put it in a file readable only by you and pass `--passphrase-file`, or set `P2P_PASSPHRASE` (it is removed from the process environment as soon as it is read, so helper processes do not inherit it). Turning encryption on for an existing installation encrypts the database and private key in place; your identity and history are kept.
+
+With the macOS and Linux keychains, `vault.key` holds your data key wrapped by a random key that lives in the keychain, so a stolen copy of the data directory is useless without your logged-in account. The keychain entry is recorded in `vault.key`, so moving the data directory on the same machine keeps working; restoring it on another machine or account does not (restore from a passphrase-protected backup instead, or start fresh). If the keychain entry is deleted the data cannot be recovered, exactly as with a forgotten passphrase.
 
 ## Security
 
@@ -162,7 +164,7 @@ Forward secrecy for offline messages comes from deleting keys. Each message uses
 
 - *Metadata.* Peer IDs, timestamps, group IDs and delivery flags stay readable in the database (they are needed to query it), and discovery announcements (username, TCP port) are broadcast in clear text to the whole LAN. Anyone on the network can see *that* you are online, though not what you say. A relay additionally learns who is writing to whom, and when, for the messages it holds.
 - *Received files and exports* are ordinary files and are not encrypted; keep them on an encrypted disk if that matters.
-- *Memory.* Keys and plaintext exist in process memory while the program runs. DPAPI protects against another user or a stolen disk, not against malware running as you.
+- *Memory.* Keys and plaintext exist in process memory while the program runs. The OS keychain protects against another user or a stolen disk, not against malware running as you.
 - *Ratchet scope.* Ratchet sessions live as long as a connection; they are not stored. Retried messages are re-encrypted for the new connection. Offline messages use their own per-message encryption (above) rather than a ratchet, so they have no post-compromise healing.
 - *Group messages and offline members.* A group message to a member who is offline is queued with relays at the moment you send it, but unlike direct messages it is not re-queued later if that failed.
 - *Relays can delay or drop.* A message queued with relays is a best effort; delivery is proven only by the recipient's receipt.
@@ -236,6 +238,8 @@ GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o lazy-chat-linux-arm64 ./cmd
 
 - **Peers don't appear**: allow UDP ports 9999-10008 and your TCP port through the firewall, make sure both machines are on the same subnet, and try `--broadcast-addr` with the subnet broadcast address.
 - **Address already in use**: pick another `--port`; discovery automatically takes the next free UDP port in its range.
+- **`could not store the key in the OS keychain` / `timed out waiting for the OS keychain`**: the keychain is locked or unavailable (a Linux session without a running Secret Service, an SSH session on macOS). Unlock it, or use `--encryption passphrase`.
+- **`key is not in the OS keychain`**: the data directory was created under another account or machine, or the keychain entry was removed.
 - **`wrong passphrase`**: the passphrase does not match this data directory. There is no recovery path; if you have lost it, start with a new `--data-dir`.
 - **`a passphrase is required`**: no terminal is attached. Use `--passphrase-file` (or `--encryption off` to opt out).
 - **`encryption is switched off`**: the data is already encrypted; remove `--encryption off`.
@@ -257,7 +261,7 @@ GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o lazy-chat-linux-arm64 ./cmd
 - [x] Offline delivery: end-to-end encrypted store-and-forward through relays, with signed receipts
 - [ ] Re-queueing of group messages to offline members after the first attempt
 - [ ] Hiding the sender from relays (sealed sender)
-- [ ] macOS Keychain and Linux Secret Service key storage (today: passphrase)
+- [x] macOS Keychain and Linux Secret Service key storage
 - [ ] Web interface
 
 ## License

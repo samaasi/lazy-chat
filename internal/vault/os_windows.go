@@ -9,9 +9,9 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// osProtect wraps data with Windows DPAPI: only the same Windows user on the
+// dpapiProtect wraps data with Windows DPAPI: only the same Windows user on the
 // same machine can unwrap it, without any passphrase.
-func osProtect(data []byte) ([]byte, error) {
+func dpapiProtect(data []byte) ([]byte, error) {
 	if len(data) == 0 {
 		return nil, errors.New("vault: nothing to protect")
 	}
@@ -26,8 +26,8 @@ func osProtect(data []byte) ([]byte, error) {
 	return append([]byte(nil), unsafe.Slice(out.Data, out.Size)...), nil
 }
 
-// osUnprotect reverses osProtect.
-func osUnprotect(blob []byte) ([]byte, error) {
+// dpapiUnprotect reverses dpapiProtect.
+func dpapiUnprotect(blob []byte) ([]byte, error) {
 	if len(blob) == 0 {
 		return nil, ErrCorrupt
 	}
