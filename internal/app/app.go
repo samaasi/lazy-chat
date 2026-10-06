@@ -10,7 +10,6 @@ import (
 
 	"github.com/samaasi/lazy-chat/internal/cli"
 	"github.com/samaasi/lazy-chat/internal/config"
-	"github.com/samaasi/lazy-chat/internal/database"
 	"github.com/samaasi/lazy-chat/internal/discovery"
 	"github.com/samaasi/lazy-chat/internal/errors"
 	"github.com/samaasi/lazy-chat/internal/filetransfer"
@@ -36,7 +35,6 @@ type App struct {
 	discovery       interfaces.PeerDiscovery
 	transferManager *filetransfer.TransferManager
 	notificationMgr *notification.NotificationManager
-	dbManager       *database.Manager
 	sqliteDB        *storage.SQLiteDB
 	groupService    *services.GroupService
 	messageHistory  *services.MessageHistoryService
@@ -77,26 +75,14 @@ func New(cfg *config.Config) (*App, error) {
 	// Create notification manager
 	notificationMgr := notification.NewNotificationManager(cfg.NotificationsEnabled)
 
-	// Create database manager and initialize
-	dbManager := database.NewManager(cfg.Database)
-	if err := dbManager.Initialize(); err != nil {
-		return nil, errors.Wrap(err, errors.ErrorTypeDatabase, "DB001", "failed to initialize database")
-	}
-
-	// Create storage instances
-	sqliteDB, err := dbManager.CreateStorageInstances()
-	if err != nil {
-		log.Fatal("Failed to create storage instances", "error", err)
-	}
-
-	// Connect to database
+	// Open the database; the storage layer owns the one and only schema.
+	sqliteDB := storage.NewSQLiteDB(cfg.Database.Path)
 	if err := sqliteDB.Connect(context.Background()); err != nil {
-		log.Fatal("Failed to connect to database", "error", err)
+		return nil, errors.Wrap(err, errors.ErrorTypeDatabase, "DB001", "failed to open database")
 	}
-
-	// Run migrations
 	if err := sqliteDB.Migrate(context.Background()); err != nil {
-		log.Fatal("Failed to run database migrations", "error", err)
+		sqliteDB.Close()
+		return nil, errors.Wrap(err, errors.ErrorTypeDatabase, "DB002", "failed to run database migrations")
 	}
 
 	// Create services
@@ -134,7 +120,6 @@ func New(cfg *config.Config) (*App, error) {
 		discovery:       discSvc,
 		transferManager: transferMgr,
 		notificationMgr: notificationMgr,
-		dbManager:       dbManager,
 		sqliteDB:        sqliteDB,
 		groupService:    groupService,
 		messageHistory:  messageHistory,
