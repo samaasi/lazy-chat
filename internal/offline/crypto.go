@@ -46,6 +46,9 @@ const (
 	// MaxPlaintext bounds one sealed message; MaxBlob bounds its ciphertext form.
 	MaxPlaintext = 16 << 10
 	MaxBlob      = 24 << 10
+	// MaxSealed bounds a message as it travels: the inner ciphertext plus the
+	// outer anonymous layer that hides the sender.
+	MaxSealed = MaxBlob + AnonOverhead
 	// MaxOPKs bounds the one-time prekeys accepted in a single bundle.
 	MaxOPKs = 64
 )

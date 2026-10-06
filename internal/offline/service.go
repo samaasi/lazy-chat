@@ -168,7 +168,15 @@ func (s *Service) OpenThen(ctx context.Context, blob []byte, accept func(plainte
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	plaintext, senderID, opkID, err := Open(s.id, ownKeys{ctx, s.store}, blob)
+	if len(blob) > MaxSealed {
+		return nil, "", ErrBadBlob
+	}
+	// Remove the anonymous outer layer first; only then is the sender visible.
+	inner, err := OpenFromSPK(ownKeys{ctx, s.store}, aadMessage(s.id.ID()), blob)
+	if err != nil {
+		return nil, "", err
+	}
+	plaintext, senderID, opkID, err := Open(s.id, ownKeys{ctx, s.store}, inner)
 	if err != nil {
 		return nil, "", err
 	}
@@ -344,5 +352,39 @@ func (s *Service) Seal(ctx context.Context, recipientID string, plaintext []byte
 			return nil, err
 		}
 	}
-	return Seal(s.id, recipientID, &st.Bundle, opk, plaintext)
+	inner, err := Seal(s.id, recipientID, &st.Bundle, opk, plaintext)
+	if err != nil {
+		return nil, err
+	}
+	// Sealed sender: the inner message names its sender (it has to, for the
+	// recipient to derive the key), so wrap it in an anonymous layer that only
+	// the recipient can remove. Anyone who stores or forwards the result sees
+	// no sender, only the recipient's signed-prekey ID.
+	return SealToSPK(st.Bundle.SPK.ID, st.Bundle.SPK.Pub, aadMessage(recipientID), inner)
+}
+
+func aadMessage(recipientID string) string { return "msg|" + recipientID }
+
+// SealFor encrypts plaintext to peerID's signed prekey for a stated purpose,
+// anonymously (the ciphertext does not identify us). It is how requests to a
+// relay are protected from the forwarder that carries them.
+func (s *Service) SealFor(ctx context.Context, peerID, purpose string, plaintext []byte) ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st, err := s.load(ctx, peerID)
+	if err != nil {
+		return nil, err
+	}
+	if st == nil || !s.fresh(&st.Bundle) {
+		return nil, ErrNoBundle
+	}
+	return SealToSPK(st.Bundle.SPK.ID, st.Bundle.SPK.Pub, purpose+"|"+peerID, plaintext)
+}
+
+// OpenFor opens a box addressed to us by SealFor.
+func (s *Service) OpenFor(ctx context.Context, purpose string, box []byte) ([]byte, error) {
+	if len(box) > MaxSealed {
+		return nil, ErrBadBox
+	}
+	return OpenFromSPK(ownKeys{ctx, s.store}, purpose+"|"+s.id.ID(), box)
 }
