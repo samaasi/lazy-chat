@@ -168,3 +168,16 @@ func TestSafetyNumber(t *testing.T) {
 		t.Fatal("not deterministic")
 	}
 }
+
+func TestDHKeyIsStableAndDistinctPerIdentity(t *testing.T) {
+	dir := t.TempDir()
+	first, _ := LoadOrCreate(dir)
+	again, _ := LoadOrCreate(dir)
+	other, _ := Generate()
+	if !first.DHKey().PublicKey().Equal(again.DHKey().PublicKey()) {
+		t.Fatal("DH key changed across restarts; offline messages to us would stop decrypting")
+	}
+	if first.DHKey().PublicKey().Equal(other.DHKey().PublicKey()) {
+		t.Fatal("two identities share a DH key")
+	}
+}
