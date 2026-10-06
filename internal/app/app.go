@@ -4,7 +4,6 @@ import (
 	"context"
 	"os"
 	"os/signal"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -52,32 +51,18 @@ func New(cfg *config.Config) (*App, error) {
 		return nil, errors.Wrap(err, errors.ErrorTypeConfig, "CFG001", "configuration validation failed")
 	}
 
-	// Create logger with configured log level and format
+	// Create logger with configured level, format and (optional) log file
 	logLevel, err := logger.ParseLevel(cfg.LogLevel)
 	if err != nil {
 		logLevel = logger.InfoLevel // Fallback to info level
 	}
-
-	var log interfaces.Logger
-	if cfg.LogFile != "" {
-		// Create logger with file output
-		fileLogger, err := logger.NewWithFile(logLevel, cfg.LogFile)
-		if err != nil {
-			return nil, errors.Wrap(err, errors.ErrorTypeConfig, "LOG001", "failed to create file logger")
-		}
-		log = fileLogger
-	} else {
-		// Create logger with stdout output
-		log = logger.New(logLevel)
-	}
-
-	// Set log format
-	if loggerImpl, ok := log.(*logger.Logger); ok {
-		if strings.ToLower(cfg.LogFormat) == "json" {
-			loggerImpl.SetFormat(logger.JSONFormat)
-		} else {
-			loggerImpl.SetFormat(logger.TextFormat)
-		}
+	log, err := logger.New(logger.Options{
+		Level:  logLevel,
+		Format: logger.ParseFormat(cfg.LogFormat),
+		File:   cfg.LogFile,
+	})
+	if err != nil {
+		return nil, errors.Wrap(err, errors.ErrorTypeConfig, "LOG001", "failed to create logger")
 	}
 
 	// Create ID generator
