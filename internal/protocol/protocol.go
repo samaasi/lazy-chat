@@ -37,6 +37,11 @@ const (
 	KindGroupInviteReply Kind = 6
 	KindGroupUpdate      Kind = 7
 
+	// KindRatchetInit starts the per-connection ratchet; KindSecure carries
+	// every application frame once it is running.
+	KindRatchetInit Kind = 8
+	KindSecure      Kind = 9
+
 	KindFileOffer  Kind = 10
 	KindFileAccept Kind = 11
 	KindFileChunk  Kind = 12
@@ -73,14 +78,30 @@ func MaxBody(k Kind) int {
 		return 64 << 10
 	case KindFileChunk:
 		return idRawLen + MaxChunkSize
+	case KindRatchetInit:
+		return 1 << 10
+	case KindSecure:
+		// The largest inner frame, plus its kind byte and the ratchet's
+		// header and authentication tag.
+		return 64<<10 + secureSlack
 	default:
 		return 0
 	}
 }
 
+// secureSlack covers the inner kind byte and the ratchet header and tag.
+const secureSlack = 128
+
+// Application reports whether k is an application frame: one that is only
+// ever carried inside a KindSecure envelope. Hello, Ping, RatchetInit and
+// Secure itself are connection plumbing and are sent in the clear (inside TLS).
+func (k Kind) Application() bool {
+	return k.known() && k != KindHello && k != KindPing && k != KindRatchetInit && k != KindSecure
+}
+
 func (k Kind) known() bool {
 	switch k {
-	case KindHello, KindPing, KindMessage, KindAck, KindGroupInvite, KindGroupInviteReply,
+	case KindHello, KindPing, KindRatchetInit, KindSecure, KindMessage, KindAck, KindGroupInvite, KindGroupInviteReply,
 		KindGroupUpdate, KindFileOffer, KindFileAccept, KindFileChunk, KindFileDone,
 		KindFileResult, KindFileAbort:
 		return true
@@ -91,7 +112,8 @@ func (k Kind) known() bool {
 // Throttled reports whether frames of this kind count against the per-peer
 // rate limit. Bulk file chunks are paced by TCP backpressure instead.
 func (k Kind) Throttled() bool {
-	return k != KindFileChunk && k != KindPing
+	// KindSecure is throttled by the kind of the frame inside it, after decryption.
+	return k != KindFileChunk && k != KindPing && k != KindSecure
 }
 
 // EncodeFrame builds the wire bytes for one frame.

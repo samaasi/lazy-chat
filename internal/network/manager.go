@@ -12,6 +12,7 @@ package network
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -27,6 +28,7 @@ import (
 	"github.com/samaasi/lazy-chat/internal/identity"
 	"github.com/samaasi/lazy-chat/internal/interfaces"
 	"github.com/samaasi/lazy-chat/internal/protocol"
+	"github.com/samaasi/lazy-chat/internal/ratchet"
 	"github.com/samaasi/lazy-chat/internal/utils"
 )
 
@@ -343,6 +345,15 @@ func (m *Manager) establish(tc *tls.Conn, expectedID string, outbound bool, ip s
 	}
 	pc.name = name
 
+	// Start the per-connection ratchet before any application frame flows.
+	peerKey, ok := certs[0].PublicKey.(ed25519.PublicKey)
+	if !ok {
+		return nil, errors.New("peer certificate does not hold an Ed25519 key")
+	}
+	if pc.sess, err = m.exchangeRatchet(tc, pc, peerID, peerKey); err != nil {
+		return nil, fmt.Errorf("ratchet: %w", err)
+	}
+
 	winner, err := m.register(pc)
 	if err != nil {
 		return nil, err
@@ -384,6 +395,40 @@ func (m *Manager) exchangeHello(tc *tls.Conn, pc *peerConn) (string, error) {
 		return "", fmt.Errorf("bad username: %w", err)
 	}
 	return utils.SanitizeText(hello.Username, config.MaxUsernameLen), nil
+}
+
+// exchangeRatchet performs the signed ephemeral key exchange that starts the
+// message ratchet. It is bound to this TLS session through exported keying
+// material, so it cannot be replayed on another connection.
+func (m *Manager) exchangeRatchet(tc *tls.Conn, pc *peerConn, peerID string, peerKey ed25519.PublicKey) (*ratchet.Session, error) {
+	_ = tc.SetDeadline(time.Now().Add(m.opts.HandshakeTimeout))
+	defer tc.SetDeadline(time.Time{})
+
+	state := tc.ConnectionState()
+	binding, err := state.ExportKeyingMaterial("lazy-chat ratchet v1", nil, 32)
+	if err != nil {
+		return nil, err
+	}
+	hs, initMsg, err := ratchet.Start(m.id.ID(), peerID, m.id, binding)
+	if err != nil {
+		return nil, err
+	}
+	frame, err := protocol.EncodeFrame(protocol.KindRatchetInit, initMsg)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := tc.Write(frame); err != nil {
+		return nil, err
+	}
+
+	kind, body, err := protocol.ReadFrame(pc.br)
+	if err != nil {
+		return nil, err
+	}
+	if kind != protocol.KindRatchetInit {
+		return nil, errors.New("expected the ratchet handshake")
+	}
+	return hs.Finish(body, peerKey)
 }
 
 // register installs pc as the connection for its peer, resolving duplicates.
@@ -494,16 +539,34 @@ func (m *Manager) readLoop(pc *peerConn) {
 		switch kind {
 		case protocol.KindPing:
 			continue
-		case protocol.KindHello:
-			m.logger.Warn("Peer sent a second Hello; disconnecting", "peer", short(pc.id))
+		case protocol.KindSecure:
+			// handled below
+		default:
+			// Hello and RatchetInit happen once, before this loop; anything
+			// else outside a sealed envelope is a protocol violation, and
+			// that includes plaintext application frames.
+			m.logger.Warn("Unexpected unencrypted frame; disconnecting", "peer", short(pc.id), "kind", kind)
 			return
 		}
 
-		if kind.Throttled() && !pc.limiter.Allow() {
+		plain, err := pc.sess.Open(body)
+		if err != nil {
+			m.logger.Warn("Message failed authentication; disconnecting", "peer", short(pc.id), "error", err)
+			return
+		}
+		if len(plain) == 0 {
+			return
+		}
+		inner, payload := protocol.Kind(plain[0]), plain[1:]
+		if !inner.Application() || len(payload) > protocol.MaxBody(inner) {
+			m.logger.Warn("Invalid sealed frame; disconnecting", "peer", short(pc.id), "kind", inner)
+			return
+		}
+		if inner.Throttled() && !pc.limiter.Allow() {
 			m.logger.Warn("Peer exceeded the message rate limit; disconnecting", "peer", short(pc.id))
 			return
 		}
-		m.dispatch(pc.id, kind, body)
+		m.dispatch(pc.id, inner, payload)
 	}
 }
 
@@ -627,15 +690,17 @@ func (m *Manager) connFor(ctx context.Context, peerID string) (*peerConn, error)
 // Send queues a frame for a peer, connecting first if needed. It returns once
 // the frame is queued, not once it has been written.
 func (m *Manager) Send(ctx context.Context, peerID string, kind protocol.Kind, body []byte) error {
-	frame, err := protocol.EncodeFrame(kind, body)
-	if err != nil {
-		return apperrors.Wrap(err, apperrors.ErrorTypeMessage, "MSG005", "failed to encode frame").WithContext("peer_id", peerID)
+	if !kind.Application() {
+		return apperrors.New(apperrors.ErrorTypeMessage, "MSG005", "only application frames can be sent").WithContext("peer_id", peerID)
+	}
+	if len(body) > protocol.MaxBody(kind) {
+		return apperrors.Wrap(protocol.ErrFrameSize, apperrors.ErrorTypeMessage, "MSG003", "frame too large for its kind").WithContext("peer_id", peerID)
 	}
 	pc, err := m.connFor(ctx, peerID)
 	if err != nil {
 		return err
 	}
-	if err := pc.enqueue(ctx, frame); err != nil {
+	if err := pc.enqueue(ctx, kind, body); err != nil {
 		return apperrors.Wrap(err, apperrors.ErrorTypeNetwork, "NET003", "failed to send to peer").WithContext("peer_id", peerID)
 	}
 	return nil

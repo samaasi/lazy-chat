@@ -1,7 +1,6 @@
 package network
 
 import (
-	"bufio"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -122,77 +121,6 @@ func send(t *testing.T, from *node, to *node, text string) {
 	t.Helper()
 	if err := from.m.Send(bg, to.id.ID(), protocol.KindMessage, []byte(text)); err != nil {
 		t.Fatal(err)
-	}
-}
-
-// rawPeer is a hand-driven protocol client, for sending things a well-behaved
-// Manager never would.
-type rawPeer struct {
-	conn *tls.Conn
-	br   *bufio.Reader
-}
-
-func dialRaw(t *testing.T, target *node, id *identity.Identity, alpn string, hello []byte) *rawPeer {
-	t.Helper()
-	cert, err := id.TLSCertificate()
-	if err != nil {
-		t.Fatal(err)
-	}
-	cfg := &tls.Config{Certificates: []tls.Certificate{cert}, InsecureSkipVerify: true, MinVersion: tls.VersionTLS13}
-	if alpn != "" {
-		cfg.NextProtos = []string{alpn}
-	}
-	raw, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(target.m.Port())), 3*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	tc := tls.Client(raw, cfg)
-	if err := tc.Handshake(); err != nil {
-		raw.Close()
-		t.Fatalf("handshake: %v", err)
-	}
-	t.Cleanup(func() { tc.Close() })
-	rp := &rawPeer{conn: tc, br: bufio.NewReader(tc)}
-	if hello != nil {
-		rp.write(t, protocol.KindHello, hello)
-		rp.expectHello(t)
-	}
-	return rp
-}
-
-func goodHello(name string) []byte {
-	b, _ := protocol.Marshal(protocol.Hello{Version: protocol.Version, Username: name})
-	return b
-}
-
-func (r *rawPeer) write(t *testing.T, k protocol.Kind, body []byte) {
-	t.Helper()
-	frame, err := protocol.EncodeFrame(k, body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := r.conn.Write(frame); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func (r *rawPeer) expectHello(t *testing.T) {
-	t.Helper()
-	_ = r.conn.SetReadDeadline(time.Now().Add(3 * time.Second))
-	k, _, err := protocol.ReadFrame(r.br)
-	if err != nil || k != protocol.KindHello {
-		t.Fatalf("expected server Hello, got kind=%d err=%v", k, err)
-	}
-}
-
-// closedBy reports whether the server closes the connection within d.
-func (r *rawPeer) closedBy(d time.Duration) bool {
-	_ = r.conn.SetReadDeadline(time.Now().Add(d))
-	for {
-		if _, _, err := protocol.ReadFrame(r.br); err != nil {
-			var ne net.Error
-			return !(errors.As(err, &ne) && ne.Timeout())
-		}
 	}
 }
 
@@ -585,8 +513,7 @@ func TestFloodIsDisconnectedButFileChunksAreNot(t *testing.T) {
 	id, _ := identity.Generate()
 	flooder := dialRaw(t, bob, id, protocol.ALPN, goodHello("flooder"))
 	for range 200 {
-		frame, _ := protocol.EncodeFrame(protocol.KindMessage, []byte("spam"))
-		if _, err := flooder.conn.Write(frame); err != nil {
+		if _, err := flooder.sealAndSend(protocol.KindMessage, []byte("spam")); err != nil {
 			break
 		}
 	}
@@ -600,8 +527,7 @@ func TestFloodIsDisconnectedButFileChunksAreNot(t *testing.T) {
 	chunk, _ := protocol.EncodeChunk("00112233445566778899aabbccddeeff", make([]byte, protocol.MaxChunkSize))
 	go func() {
 		for range 300 {
-			f, _ := protocol.EncodeFrame(protocol.KindFileChunk, chunk)
-			if _, err := sender.conn.Write(f); err != nil {
+			if _, err := sender.sealAndSend(protocol.KindFileChunk, chunk); err != nil {
 				return
 			}
 		}

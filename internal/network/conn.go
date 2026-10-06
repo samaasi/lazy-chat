@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/samaasi/lazy-chat/internal/protocol"
+	"github.com/samaasi/lazy-chat/internal/ratchet"
 	"github.com/samaasi/lazy-chat/internal/utils"
 )
 
@@ -32,6 +33,15 @@ const (
 // ErrConnClosed is returned when sending on a connection that has closed.
 var ErrConnClosed = errors.New("connection closed")
 
+// outFrame is an application frame waiting to be sealed and written. It is
+// queued unencrypted and sealed by the writer goroutine just before it hits
+// the wire, so message numbers always match wire order and a send that is
+// cancelled while queued never consumes a ratchet key.
+type outFrame struct {
+	kind protocol.Kind
+	body []byte
+}
+
 // peerConn is one authenticated connection to a peer.
 type peerConn struct {
 	id       string
@@ -41,8 +51,9 @@ type peerConn struct {
 	remote   string // remote IP, for slot accounting
 
 	br      *bufio.Reader
-	out     chan []byte
+	out     chan outFrame
 	done    chan struct{}
+	sess    *ratchet.Session // set once the ratchet handshake has completed
 	once    sync.Once
 	limiter *utils.Limiter
 
@@ -59,7 +70,7 @@ func newPeerConn(id string, conn *tls.Conn, outbound bool, selfID, remote string
 	pc := &peerConn{
 		id: id, conn: conn, outbound: outbound, remote: remote,
 		br:      bufio.NewReader(conn),
-		out:     make(chan []byte, sendQueueSize),
+		out:     make(chan outFrame, sendQueueSize),
 		done:    make(chan struct{}),
 		limiter: utils.NewLimiter(rate, burst),
 	}
@@ -79,10 +90,11 @@ func (pc *peerConn) close() {
 	})
 }
 
-// enqueue schedules an encoded frame for writing. It blocks while the queue
-// is full (this is the back-pressure that paces file transfers) and returns
-// when the frame is queued, the context ends, or the connection dies.
-func (pc *peerConn) enqueue(ctx context.Context, frame []byte) error {
+// enqueue schedules an application frame for writing. It blocks while the
+// queue is full (this is the back-pressure that paces file transfers) and
+// returns when the frame is queued, the context ends, or the connection dies.
+func (pc *peerConn) enqueue(ctx context.Context, kind protocol.Kind, body []byte) error {
+	frame := outFrame{kind: kind, body: body}
 	select {
 	case <-pc.done:
 		return ErrConnClosed
@@ -96,6 +108,18 @@ func (pc *peerConn) enqueue(ctx context.Context, frame []byte) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// seal wraps an application frame in a ratchet-encrypted KindSecure frame.
+func (pc *peerConn) seal(f outFrame) ([]byte, error) {
+	plain := make([]byte, 1+len(f.body))
+	plain[0] = byte(f.kind)
+	copy(plain[1:], f.body)
+	sealed, err := pc.sess.Seal(plain)
+	if err != nil {
+		return nil, err
+	}
+	return protocol.EncodeFrame(protocol.KindSecure, sealed)
 }
 
 // writeLoop is the only goroutine that writes to the connection after setup.
@@ -118,8 +142,14 @@ func (pc *peerConn) writeLoop(onError func(error)) {
 		select {
 		case <-pc.done:
 			return
-		case frame := <-pc.out:
-			if !write(frame) {
+		case f := <-pc.out:
+			wire, err := pc.seal(f)
+			if err != nil {
+				onError(err)
+				pc.close()
+				return
+			}
+			if !write(wire) {
 				return
 			}
 		case <-ticker.C:
