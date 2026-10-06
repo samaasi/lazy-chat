@@ -6,6 +6,7 @@ import (
 	"errors"
 	"math/rand/v2"
 	"net"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -327,4 +328,76 @@ func TestGarbageOverTheWire(t *testing.T) {
 	}
 	b := newSvc(t, "bob", a.opts.BasePort)
 	eventually(t, "discovery after garbage", func() bool { _, ok := a.peers.GetPeer(b.id.ID()); return ok })
+}
+
+func ipnet(cidr string) *net.IPNet {
+	ip, n, err := net.ParseCIDR(cidr)
+	if err != nil {
+		panic(err)
+	}
+	n.IP = ip // keep the host address, as net.Interface.Addrs does
+	return n
+}
+
+func testService(bcast string, ifs ...iface) *Service {
+	id, _ := identity.Generate()
+	s := NewService(Options{BasePort: 9999, PortRange: 3, BroadcastAddr: bcast, Interval: time.Second}, id, logger.Discard(), peer.NewManager(logger.Discard()))
+	s.bcast = net.ParseIP(bcast).To4()
+	s.port = 9999
+	s.interfaces = func() ([]iface, error) { return ifs, nil }
+	return s
+}
+
+// Two machines both bind the first port of the range. If an instance did not
+// announce to its own port number, they would never hear each other.
+func TestAnnouncementsReachTheSamePortOnOtherMachines(t *testing.T) {
+	s := testService("255.255.255.255")
+	var ports []int
+	for _, a := range s.targets() {
+		ports = append(ports, a.Port)
+	}
+	if !slices.Contains(ports, 9999) {
+		t.Fatalf("announcements skip our own port number, which other machines also use: %v", ports)
+	}
+	if len(ports) != 3 {
+		t.Fatalf("want every port of the range once per address, got %v", ports)
+	}
+}
+
+func TestBroadcastGoesOutOfEveryAdapter(t *testing.T) {
+	up := net.FlagUp | net.FlagBroadcast
+	s := testService("255.255.255.255",
+		iface{flags: up, addrs: []net.Addr{ipnet("192.168.1.18/24"), ipnet("fe80::1/64")}}, // the LAN (and IPv6, ignored)
+		iface{flags: up, addrs: []net.Addr{ipnet("172.23.176.1/20")}},                      // WSL's virtual adapter
+		iface{flags: up, addrs: []net.Addr{ipnet("192.168.1.19/24")}},                      // a second address on the same LAN: no duplicate
+		iface{flags: up | net.FlagLoopback, addrs: []net.Addr{ipnet("127.0.0.1/8")}},       // loopback: no
+		iface{flags: net.FlagBroadcast, addrs: []net.Addr{ipnet("10.0.0.5/8")}},            // down: no
+		iface{flags: net.FlagUp, addrs: []net.Addr{ipnet("10.9.0.2/24")}},                  // point-to-point VPN: no
+		iface{flags: up, addrs: []net.Addr{ipnet("169.254.3.4/16")}},                       // link-local: no
+		iface{flags: up, addrs: []net.Addr{ipnet("100.64.0.7/32")}},                        // a single host: no
+	)
+	var got []string
+	for _, ip := range s.broadcastAddrs() {
+		got = append(got, ip.String())
+	}
+	want := []string{"255.255.255.255", "192.168.1.255", "172.23.191.255"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("broadcast addresses %v, want %v", got, want)
+	}
+}
+
+func TestAnExplicitBroadcastAddressIsRespected(t *testing.T) {
+	s := testService("192.168.1.255",
+		iface{flags: net.FlagUp | net.FlagBroadcast, addrs: []net.Addr{ipnet("172.23.176.1/20")}})
+	if got := s.broadcastAddrs(); len(got) != 1 || got[0].String() != "192.168.1.255" {
+		t.Fatalf("got %v", got)
+	}
+}
+
+func TestInterfaceListingFailureStillBroadcasts(t *testing.T) {
+	s := testService("255.255.255.255")
+	s.interfaces = func() ([]iface, error) { return nil, errors.New("no permission") }
+	if got := s.broadcastAddrs(); len(got) != 1 || !got[0].Equal(net.IPv4bcast) {
+		t.Fatalf("got %v", got)
+	}
 }

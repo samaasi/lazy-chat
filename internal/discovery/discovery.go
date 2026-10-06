@@ -92,10 +92,13 @@ type Service struct {
 
 	limiter *utils.KeyedLimiter
 
+	// interfaces lists the machine's network interfaces (replaceable in tests).
+	interfaces func() ([]iface, error)
+
 	mu       sync.Mutex
 	conn     *net.UDPConn
 	port     int
-	targets  []*net.UDPAddr
+	bcast    net.IP           // the configured broadcast address
 	lastSeen map[string]int64 // peer ID -> newest accepted timestamp
 	started  bool
 
@@ -110,9 +113,10 @@ var _ interfaces.PeerDiscovery = (*Service)(nil)
 func NewService(opts Options, id *identity.Identity, logger interfaces.Logger, peers interfaces.PeerManager) *Service {
 	return &Service{
 		opts: opts, id: id, logger: logger, peers: peers,
-		now:      time.Now,
-		limiter:  utils.NewKeyedLimiter(sourceRate, sourceBurst, maxSources),
-		lastSeen: make(map[string]int64),
+		now:        time.Now,
+		limiter:    utils.NewKeyedLimiter(sourceRate, sourceBurst, maxSources),
+		lastSeen:   make(map[string]int64),
+		interfaces: systemInterfaces,
 	}
 }
 
@@ -156,12 +160,7 @@ func (s *Service) Start(ctx context.Context) error {
 			WithContext("port_range", fmt.Sprintf("%d-%d", s.opts.BasePort, s.opts.BasePort+s.opts.PortRange-1))
 	}
 
-	for p := s.opts.BasePort; p < s.opts.BasePort+s.opts.PortRange; p++ {
-		if p != s.port {
-			s.targets = append(s.targets, &net.UDPAddr{IP: ip, Port: p})
-		}
-	}
-
+	s.bcast = ip
 	s.conn = conn
 	s.started = true
 	s.ctx, s.cancel = context.WithCancel(ctx)
@@ -215,11 +214,106 @@ func (s *Service) announce(conn *net.UDPConn) {
 		s.logger.Error("Failed to build announcement", "error", err)
 		return
 	}
-	for _, t := range s.targets {
+	for _, t := range s.targets() {
 		if _, err := conn.WriteToUDP(data, t); err != nil && s.ctx.Err() == nil {
 			s.logger.Debug("Announcement not sent", "target", t.String(), "error", err)
 		}
 	}
+}
+
+// targets is every address an announcement goes to: each broadcast address
+// (see broadcastAddrs) on every port of the range. That includes the port we
+// listen on ourselves: on another machine a peer most likely took the very
+// same one. (Our own copies are recognised and dropped on arrival.)
+func (s *Service) targets() []*net.UDPAddr {
+	var out []*net.UDPAddr
+	for _, ip := range s.broadcastAddrs() {
+		for p := s.opts.BasePort; p < s.opts.BasePort+s.opts.PortRange; p++ {
+			out = append(out, &net.UDPAddr{IP: ip, Port: p})
+		}
+	}
+	return out
+}
+
+// broadcastAddrs returns the configured broadcast address and, when that is
+// the generic 255.255.255.255, also the broadcast address of each local IPv4
+// network. Windows sends 255.255.255.255 out of a single adapter, which on a
+// machine with virtual adapters (WSL, Hyper-V, VPNs) is often not the LAN;
+// a subnet's own broadcast address is routed out of the right one. The list is
+// rebuilt each time, so adapters that come and go are followed.
+func (s *Service) broadcastAddrs() []net.IP {
+	out := []net.IP{s.bcast}
+	if !s.bcast.Equal(net.IPv4bcast) {
+		return out // an explicit choice by the user: respect it
+	}
+	ifs, err := s.interfaces()
+	if err != nil {
+		s.logger.Debug("Could not list network interfaces", "error", err)
+		return out
+	}
+	seen := map[string]bool{s.bcast.String(): true}
+	for _, i := range ifs {
+		for _, b := range i.broadcasts() {
+			if !seen[b.String()] {
+				seen[b.String()] = true
+				out = append(out, b)
+			}
+		}
+	}
+	return out
+}
+
+// iface is the part of a network interface that broadcasting needs.
+type iface struct {
+	flags net.Flags
+	addrs []net.Addr
+}
+
+func systemInterfaces() ([]iface, error) {
+	sys, err := net.Interfaces()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]iface, 0, len(sys))
+	for _, i := range sys {
+		addrs, err := i.Addrs()
+		if err != nil {
+			continue
+		}
+		out = append(out, iface{flags: i.Flags, addrs: addrs})
+	}
+	return out, nil
+}
+
+// broadcasts returns the directed broadcast address of each IPv4 network on
+// an interface that is up and can broadcast.
+func (i iface) broadcasts() []net.IP {
+	if i.flags&net.FlagUp == 0 || i.flags&net.FlagBroadcast == 0 || i.flags&net.FlagLoopback != 0 {
+		return nil
+	}
+	var out []net.IP
+	for _, a := range i.addrs {
+		n, ok := a.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		ip, mask := n.IP.To4(), n.Mask
+		if ip == nil || len(mask) == net.IPv6len {
+			mask = mask[len(mask)-4:]
+		}
+		if ip == nil || len(mask) != 4 || ip.IsLinkLocalUnicast() {
+			continue
+		}
+		if ones, _ := net.IPMask(mask).Size(); ones == 0 || ones >= 31 {
+			continue // no meaningful broadcast address
+		}
+		b := make(net.IP, 4)
+		for k := range b {
+			b[k] = ip[k] | ^mask[k]
+		}
+		out = append(out, b)
+	}
+	return out
 }
 
 func (s *Service) buildAnnouncement() ([]byte, error) {
