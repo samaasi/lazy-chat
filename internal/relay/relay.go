@@ -1,20 +1,37 @@
-// Package relay delivers messages to peers that are offline, by store-and-forward.
+// Package relay delivers messages to peers that are offline, by store-and-forward,
+// without letting the peers that carry them learn who is talking.
 //
-// A sender encrypts the message to the recipient's prekeys (package offline)
-// and hands the ciphertext to a few of the peers it is connected to. Those
-// relays hold it until the recipient next connects to any of them, then pass it
-// on. The recipient decrypts it, stores it as an ordinary message, and returns a
-// signed receipt that travels back through the relay to the sender.
+// A sender encrypts the message to the recipient's prekeys (package offline),
+// hiding her own identity inside, and asks a few peers - relays - to hold the
+// ciphertext. The recipient collects it from any of them when they next
+// connect, stores it as an ordinary message, and returns a signed receipt.
 //
-// What a relay learns: who the message is from and for, when, and roughly how
-// big it is. What it cannot do: read it (only the recipient holds the keys),
-// alter it (it is authenticated), forge a receipt (signed by the recipient), or
-// impersonate the sender. What it can do is delay or drop it, which is why
-// senders use several relays and keep retrying direct delivery.
+// # Who learns what
+//
+// A relay sees who a message is for, when and how big, never what it says. With
+// sealed sender it does not see who it is from either, at two levels:
+//
+//   - In the data: the sender's identity is inside the end-to-end encryption.
+//   - On the wire: a relay sees whoever connects to it, and that would be the
+//     sender. So requests are sealed to the relay and carried by a one-hop
+//     forwarder, a second peer the sender is connected to. The forwarder knows
+//     who is asking and which relay, but not what, nor for whom (the request is
+//     sealed); the relay knows the recipient, but sees only the forwarder.
+//     Neither alone can link sender to recipient.
+//
+// Receipts follow the same discipline: the recipient files them under a random
+// mailbox tag that only it and the sender know, and the sender collects them
+// through a forwarder, so the relay never learns whose mailbox it is.
+//
+// When fewer than three peers are connected (sender, forwarder, relay) no
+// forwarder exists, and the sender is visible to the relay it talks to.
+// By default the request then goes direct and the user is told; with
+// RequireAnonymous it waits instead.
 package relay
 
 import (
 	"context"
+	"crypto/ecdh"
 	"crypto/rand"
 	"encoding/json"
 	"errors"
@@ -25,6 +42,7 @@ import (
 
 	"github.com/samaasi/lazy-chat/internal/identity"
 	"github.com/samaasi/lazy-chat/internal/interfaces"
+	"github.com/samaasi/lazy-chat/internal/models"
 	"github.com/samaasi/lazy-chat/internal/offline"
 	"github.com/samaasi/lazy-chat/internal/protocol"
 	"github.com/samaasi/lazy-chat/internal/storage"
@@ -40,29 +58,40 @@ const (
 	minTTL           = time.Minute
 	defaultReplicas  = 3
 	maxStoreAttempts = 8
+	maxForwarders    = 2 // forwarders tried per request
 	deliverBatch     = 100
-	receiptBatch     = 200
+	maxFetchTags     = 100
 	opTimeout        = 15 * time.Second
 	maxWireID        = 64
+
+	maxPendingForwards = 2048
+	forwardTTL         = 30 * time.Second
+
+	purposeRequest = "relay-request"
+	purposeReply   = "relay-reply"
 )
 
 // Errors returned by Dispatch.
 var (
-	ErrNoRelay = errors.New("no connected peer agreed to hold the message")
-	ErrNoPeers = errors.New("not connected to anyone who could hold the message")
-	errRejects = errors.New("message rejected")
+	ErrNoRelay         = errors.New("no connected peer agreed to hold the message")
+	ErrNoPeers         = errors.New("not connected to anyone who could hold the message")
+	ErrNoAnonymousPath = errors.New("no way to queue the message without revealing who sent it (connect to more peers, or allow it with sealed_sender=auto)")
+	errRejected        = errors.New("message rejected")
 )
 
 // Options configures a Manager. Zero values select the defaults.
 type Options struct {
-	// Enabled makes this peer hold messages for others. Sending through other
-	// relays works either way.
+	// Enabled makes this peer hold messages and forward requests for others.
+	// Sending through other peers' relays works either way.
 	Enabled    bool
 	MaxStorage int64
 	// Limits overrides the derived storage limits (mainly for tests).
-	Limits        *storage.RelayLimits
+	Limits *storage.RelayLimits
+	// RequireAnonymous refuses to contact a relay except through a forwarder.
+	RequireAnonymous bool
+
 	Replicas      int           // relays asked per message
-	StoreTimeout  time.Duration // wait for a relay's answer
+	StoreTimeout  time.Duration // wait for an answer
 	BundleTimeout time.Duration // wait for a gossiped bundle
 }
 
@@ -100,7 +129,7 @@ func (o *Options) limits() storage.RelayLimits {
 type MessageFunc func(ctx context.Context, senderID string, plaintext []byte) (msgID string, accepted bool)
 
 // ReceiptFunc is called when a verified delivery receipt arrives. signerID is
-// who signed it; the caller must check that is really the message's recipient.
+// who signed it, and has been checked to be the recipient we addressed.
 type ReceiptFunc func(ctx context.Context, msgID, signerID string)
 
 // Deps are the collaborators of a Manager.
@@ -112,17 +141,32 @@ type Deps struct {
 	Store   storage.RelayStorage
 }
 
-// Manager implements all three roles: sender, relay and recipient.
+// result is what a waiting request receives.
+type result struct {
+	sealed []byte
+	err    error
+}
+
+type forward struct {
+	from string
+	at   time.Time
+}
+
+// Manager implements all four roles: sender, forwarder, relay and recipient.
 type Manager struct {
 	Deps
 	opts Options
 	now  func() time.Time
 
+	forwardLimiter *utils.KeyedLimiter
+
 	mu            sync.Mutex
 	onMessage     MessageFunc
 	onReceipt     ReceiptFunc
-	storeWaiters  map[string]chan protocol.RelayStored // "relayID/envelopeID"
+	waiters       map[string]chan result // "fwd:forwarder/id" or "direct:relay/id"
+	forwards      map[string]forward     // "relay/id" -> who asked us to forward it
 	bundleWaiters map[string][]chan struct{}
+	fetching      bool
 	closed        bool
 	wg            sync.WaitGroup
 }
@@ -134,8 +178,10 @@ func NewManager(opts Options, deps Deps) *Manager {
 	opts.defaults()
 	return &Manager{
 		Deps: deps, opts: opts, now: time.Now,
-		storeWaiters:  map[string]chan protocol.RelayStored{},
-		bundleWaiters: map[string][]chan struct{}{},
+		forwardLimiter: utils.NewKeyedLimiter(2, 20, 1024),
+		waiters:        map[string]chan result{},
+		forwards:       map[string]forward{},
+		bundleWaiters:  map[string][]chan struct{}{},
 	}
 }
 
@@ -151,11 +197,12 @@ func (m *Manager) Register() {
 	m.Net.Handle(protocol.KindPrekeys, m.onPrekeys)
 	m.Net.Handle(protocol.KindBundleRequest, m.onBundleRequest)
 	m.Net.Handle(protocol.KindBundleResponse, m.onBundleResponse)
-	m.Net.Handle(protocol.KindRelayStore, m.onStore)
-	m.Net.Handle(protocol.KindRelayStored, m.onStored)
+	m.Net.Handle(protocol.KindRelayRequest, m.onRequest)
+	m.Net.Handle(protocol.KindRelayResponse, m.onResponse)
 	m.Net.Handle(protocol.KindRelayDeliver, m.onDeliver)
 	m.Net.Handle(protocol.KindRelayAck, m.onAck)
-	m.Net.Handle(protocol.KindRelayReceipt, m.onReceiptFrame)
+	m.Net.Handle(protocol.KindRelayForward, m.onForward)
+	m.Net.Handle(protocol.KindRelayForwardReply, m.onForwardReply)
 	m.Net.AddListener(m)
 }
 
@@ -212,18 +259,24 @@ func (m *Manager) Usage(ctx context.Context) (envelopes int, bytes, capacity int
 // Enabled reports whether this peer holds messages for others.
 func (m *Manager) Enabled() bool { return m.opts.Enabled }
 
-// Maintain purges expired envelopes and receipts and old prekeys.
+// Maintain purges expired envelopes, receipts, bookkeeping and old prekeys.
 func (m *Manager) Maintain(ctx context.Context) error {
-	if _, _, err := m.Store.PurgeRelay(ctx, m.now()); err != nil {
+	now := m.now()
+	if _, _, err := m.Store.PurgeRelay(ctx, now); err != nil {
 		return err
 	}
+	if _, err := m.Store.PurgeOutbox(ctx, now.Add(-MaxTTL)); err != nil {
+		return err
+	}
+	m.expireForwards(now)
+	m.FetchReceipts(ctx)
 	return m.Offline.Maintain(ctx)
 }
 
 // ---- Connections ---------------------------------------------------------------
 
-// PeerConnected sends our bundle to the new peer and, as a relay, hands over
-// whatever we are holding for them.
+// PeerConnected sends our bundle to the new peer, hands over whatever we hold
+// for them, and looks for receipts that may be waiting.
 func (m *Manager) PeerConnected(peerID, _ string) {
 	m.background(func(ctx context.Context) {
 		b, err := m.Offline.OurBundleFor(ctx, peerID)
@@ -235,7 +288,7 @@ func (m *Manager) PeerConnected(peerID, _ string) {
 			}
 		}
 		m.deliverHeld(ctx, peerID)
-		m.deliverReceipts(ctx, peerID)
+		m.FetchReceipts(ctx)
 	})
 }
 
@@ -255,6 +308,18 @@ func (m *Manager) onPrekeys(from string, body []byte) {
 	// The bundle must belong to the authenticated peer that sent it.
 	if err := m.Offline.RememberBundle(ctx, from, &b); err != nil {
 		m.Logger.Debug("Ignored prekey bundle", "peer", short(from), "reason", err.Error())
+		return
+	}
+	m.wakeBundleWaiters(from)
+}
+
+func (m *Manager) wakeBundleWaiters(peerID string) {
+	m.mu.Lock()
+	waiters := m.bundleWaiters[peerID]
+	delete(m.bundleWaiters, peerID)
+	m.mu.Unlock()
+	for _, w := range waiters {
+		close(w)
 	}
 }
 
@@ -285,13 +350,7 @@ func (m *Manager) onBundleResponse(from string, body []byte) {
 	if err := m.Offline.RememberBundle(ctx, r.PeerID, &b); err != nil {
 		return
 	}
-	m.mu.Lock()
-	waiters := m.bundleWaiters[r.PeerID]
-	delete(m.bundleWaiters, r.PeerID)
-	m.mu.Unlock()
-	for _, w := range waiters {
-		close(w)
-	}
+	m.wakeBundleWaiters(r.PeerID)
 }
 
 // fetchBundle asks connected peers whether they hold a bundle for target.
@@ -322,14 +381,46 @@ func (m *Manager) fetchBundle(ctx context.Context, target string) error {
 	}
 }
 
-// ---- Sending ---------------------------------------------------------------------
+// ---- Requests: the sender's side ---------------------------------------------------
 
-// candidates lists connected peers other than exclude and ourselves, in random
-// order so that load and trust are spread around.
-func (m *Manager) candidates(exclude string) []string {
+// request is the plaintext inside a sealed RelayRequest.
+type request struct {
+	Op    string `json:"op"`    // "store" or "fetch"
+	Reply []byte `json:"reply"` // one-off X25519 public key to seal the answer to
+
+	ID      string `json:"id,omitempty"` // store: the envelope's ID
+	To      string `json:"to,omitempty"`
+	Blob    []byte `json:"blob,omitempty"`
+	Expires int64  `json:"expires,omitempty"`
+
+	Tags []string `json:"tags,omitempty"` // fetch: mailbox tags to look under
+}
+
+type receiptEntry struct {
+	Tag    string `json:"tag"`
+	MsgID  string `json:"msg_id"`
+	Signer string `json:"signer"`
+	EdPub  []byte `json:"ed"`
+	Sig    []byte `json:"sig"`
+}
+
+// response is the plaintext inside a sealed RelayResponse.
+type response struct {
+	OK       bool           `json:"ok"`
+	Reason   string         `json:"reason,omitempty"`
+	Receipts []receiptEntry `json:"receipts,omitempty"`
+}
+
+// candidates lists connected peers other than the excluded ones and ourselves,
+// in random order so that load and trust are spread around.
+func (m *Manager) candidates(exclude ...string) []string {
+	skip := map[string]bool{m.Self.ID(): true}
+	for _, e := range exclude {
+		skip[e] = true
+	}
 	var out []string
 	for _, id := range m.Net.ConnectedPeers() {
-		if id != exclude && id != m.Self.ID() {
+		if !skip[id] {
 			out = append(out, id)
 		}
 	}
@@ -343,119 +434,396 @@ func (m *Manager) candidates(exclude string) []string {
 	return out
 }
 
+// call sends a request to relayID and returns its answer. It goes through a
+// forwarder when one exists, so the relay does not see us; anonymous reports
+// whether it did. avoid is a peer that must not be used as forwarder (the
+// message's recipient).
+func (m *Manager) call(ctx context.Context, relayID, avoid string, req request) (resp response, anonymous bool, err error) {
+	replyKey, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		return resp, false, err
+	}
+	req.Reply = replyKey.PublicKey().Bytes()
+	plain, err := json.Marshal(req)
+	if err != nil {
+		return resp, false, err
+	}
+	// A relay's prekeys arrive just after we connect to it; a request made in
+	// that instant waits for them rather than failing.
+	m.awaitBundle(ctx, relayID)
+	sealed, err := m.Offline.SealFor(ctx, relayID, purposeRequest, plain)
+	if err != nil {
+		return resp, false, err
+	}
+	id := utils.NewID()
+
+	answer, anonymous, err := m.carry(ctx, relayID, avoid, id, sealed)
+	if err != nil {
+		return resp, false, err
+	}
+	out, err := offline.OpenWithKey(replyKey, purposeReply+"|"+id, answer)
+	if err != nil {
+		return resp, false, fmt.Errorf("the relay's answer could not be read: %w", err)
+	}
+	if err := json.Unmarshal(out, &resp); err != nil {
+		return resp, false, err
+	}
+	return resp, anonymous, nil
+}
+
+// awaitBundle waits briefly for peerID's prekey bundle, which a connected
+// peer sends unprompted.
+func (m *Manager) awaitBundle(ctx context.Context, peerID string) {
+	if m.Offline.HasBundle(ctx, peerID) {
+		return
+	}
+	wait := make(chan struct{})
+	m.mu.Lock()
+	m.bundleWaiters[peerID] = append(m.bundleWaiters[peerID], wait)
+	m.mu.Unlock()
+	if m.Offline.HasBundle(ctx, peerID) { // it arrived while we registered
+		return
+	}
+	select {
+	case <-wait:
+	case <-time.After(m.opts.BundleTimeout):
+	case <-ctx.Done():
+	}
+}
+
+// carry delivers a sealed request and returns the sealed answer.
+func (m *Manager) carry(ctx context.Context, relayID, avoid, id string, sealed []byte) (answer []byte, anonymous bool, err error) {
+	var lastErr error
+	tried := 0
+	for _, fwd := range m.candidates(relayID, avoid) {
+		if tried == maxForwarders {
+			break
+		}
+		tried++
+		a, err := m.viaForwarder(ctx, fwd, relayID, id, sealed)
+		if err == nil {
+			return a, true, nil
+		}
+		lastErr = err
+	}
+	if m.opts.RequireAnonymous {
+		if lastErr != nil {
+			return nil, false, fmt.Errorf("%w: %v", ErrNoAnonymousPath, lastErr)
+		}
+		return nil, false, ErrNoAnonymousPath
+	}
+	a, err := m.direct(ctx, relayID, id, sealed)
+	return a, false, err
+}
+
+func (m *Manager) await(ctx context.Context, key string, send func() error) ([]byte, error) {
+	w := make(chan result, 1)
+	m.mu.Lock()
+	m.waiters[key] = w
+	m.mu.Unlock()
+	defer func() {
+		m.mu.Lock()
+		delete(m.waiters, key)
+		m.mu.Unlock()
+	}()
+	if err := send(); err != nil {
+		return nil, err
+	}
+	select {
+	case r := <-w:
+		return r.sealed, r.err
+	case <-time.After(m.opts.StoreTimeout):
+		return nil, errors.New("no answer")
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (m *Manager) viaForwarder(ctx context.Context, fwd, relayID, id string, sealed []byte) ([]byte, error) {
+	return m.await(ctx, "fwd:"+fwd+"/"+id, func() error {
+		return m.Net.SendJSON(ctx, fwd, protocol.KindRelayForward, protocol.RelayForward{ID: id, Relay: relayID, Sealed: sealed})
+	})
+}
+
+func (m *Manager) direct(ctx context.Context, relayID, id string, sealed []byte) ([]byte, error) {
+	return m.await(ctx, "direct:"+relayID+"/"+id, func() error {
+		return m.Net.SendJSON(ctx, relayID, protocol.KindRelayRequest, protocol.RelayRequest{ID: id, Sealed: sealed})
+	})
+}
+
+// wrapped is the payload inside the end-to-end encryption of a relayed message:
+// the application message and the mailbox tag its receipt will be filed under.
+type wrapped struct {
+	Tag     string          `json:"tag"`
+	Payload json.RawMessage `json:"payload"`
+}
+
 // Dispatch encrypts plaintext for `to` and asks connected peers to hold it.
-// It returns how many accepted. It fails when the recipient's prekeys cannot
-// be found, nobody is connected, or nobody accepts.
-func (m *Manager) Dispatch(ctx context.Context, to string, plaintext []byte) (int, error) {
-	if !identity.ValidID(to) || to == m.Self.ID() {
-		return 0, errors.New("invalid recipient")
+// msgID names the message for the delivery receipt. It fails when the
+// recipient's prekeys cannot be found, nobody is connected, nobody accepts, or
+// (with RequireAnonymous) no forwarder is available.
+func (m *Manager) Dispatch(ctx context.Context, to, msgID string, plaintext []byte) (models.RelayResult, error) {
+	var res models.RelayResult
+	if !identity.ValidID(to) || to == m.Self.ID() || !validWireID(msgID) {
+		return res, errors.New("invalid recipient or message")
 	}
 	if !m.Offline.HasBundle(ctx, to) {
 		if err := m.fetchBundle(ctx, to); err != nil && !m.Offline.HasBundle(ctx, to) {
-			return 0, fmt.Errorf("cannot encrypt for an offline recipient: %w", err)
+			return res, fmt.Errorf("cannot encrypt for an offline recipient: %w", err)
 		}
 	}
-	blob, err := m.Offline.Seal(ctx, to, plaintext)
+	tag := utils.NewID()
+	inner, err := json.Marshal(wrapped{Tag: tag, Payload: plaintext})
 	if err != nil {
-		return 0, fmt.Errorf("cannot encrypt for an offline recipient: %w", err)
+		return res, err
+	}
+	sealed, err := m.Offline.Seal(ctx, to, inner)
+	if err != nil {
+		return res, fmt.Errorf("cannot encrypt for an offline recipient: %w", err)
 	}
 
 	cands := m.candidates(to)
 	if len(cands) == 0 {
-		return 0, ErrNoPeers
+		return res, ErrNoPeers
 	}
-	envelopeID := utils.NewID()
-	req := protocol.RelayStore{ID: envelopeID, To: to, Blob: blob, Expires: m.now().Add(MaxTTL).UnixMilli()}
+	req := request{Op: "store", ID: utils.NewID(), To: to, Blob: sealed, Expires: m.now().Add(MaxTTL).UnixMilli()}
 
-	stored := 0
-	var lastReason string
+	var lastErr error
 	for i, relayID := range cands {
-		if stored >= m.opts.Replicas || i >= maxStoreAttempts {
+		if res.Relays >= m.opts.Replicas || i >= maxStoreAttempts {
 			break
 		}
-		ok, reason := m.storeAt(ctx, relayID, req)
-		if ok {
-			stored++
-		} else if reason != "" {
-			lastReason = reason
+		resp, anonymous, err := m.call(ctx, relayID, to, req)
+		switch {
+		case errors.Is(err, ErrNoAnonymousPath):
+			return res, err // the same for every relay: stop asking
+		case err != nil:
+			lastErr = err
+			continue
+		case !resp.OK:
+			lastErr = errors.New(resp.Reason)
+			continue
+		}
+		res.Relays++
+		if !anonymous {
+			res.Exposed++
+		}
+		if err := m.Store.AddOutbox(ctx, storage.OutboxEntry{MsgID: msgID, RelayID: relayID, To: to, Tag: tag, Created: m.now()}); err != nil {
+			m.Logger.Warn("Could not record a queued message", "error", err)
 		}
 	}
-	if stored == 0 {
-		if lastReason != "" {
-			return 0, fmt.Errorf("%w (%s)", ErrNoRelay, lastReason)
+	if res.Relays == 0 {
+		if lastErr != nil {
+			return res, fmt.Errorf("%w (%v)", ErrNoRelay, lastErr)
 		}
-		return 0, ErrNoRelay
+		return res, ErrNoRelay
 	}
-	return stored, nil
+	return res, nil
 }
 
-func (m *Manager) storeAt(ctx context.Context, relayID string, req protocol.RelayStore) (bool, string) {
-	key := relayID + "/" + req.ID
-	waiter := make(chan protocol.RelayStored, 1)
+// FetchReceipts asks the relays that hold our messages whether the recipients
+// have collected them, and applies the signed receipts that are there. Each
+// receipt is verified and must come from the recipient we addressed.
+func (m *Manager) FetchReceipts(ctx context.Context) {
 	m.mu.Lock()
-	m.storeWaiters[key] = waiter
-	m.mu.Unlock()
-	defer func() {
-		m.mu.Lock()
-		delete(m.storeWaiters, key)
+	if m.fetching || m.closed {
 		m.mu.Unlock()
-	}()
-
-	if err := m.Net.SendJSON(ctx, relayID, protocol.KindRelayStore, req); err != nil {
-		return false, ""
+		return
 	}
-	select {
-	case r := <-waiter:
-		return r.OK, r.Reason
-	case <-time.After(m.opts.StoreTimeout):
-		return false, ""
-	case <-ctx.Done():
-		return false, ""
+	m.fetching = true
+	onReceipt := m.onReceipt
+	m.mu.Unlock()
+	defer func() { m.mu.Lock(); m.fetching = false; m.mu.Unlock() }()
+
+	entries, err := m.Store.Outbox(ctx, m.now().Add(-MaxTTL))
+	if err != nil || len(entries) == 0 {
+		return
+	}
+	byRelay := map[string][]storage.OutboxEntry{}
+	for _, e := range entries {
+		byRelay[e.RelayID] = append(byRelay[e.RelayID], e)
+	}
+
+	for relayID, list := range byRelay {
+		if ctx.Err() != nil {
+			return
+		}
+		tags := map[string]bool{}
+		for _, e := range list {
+			if len(tags) < maxFetchTags {
+				tags[e.Tag] = true
+			}
+		}
+		req := request{Op: "fetch"}
+		for t := range tags {
+			req.Tags = append(req.Tags, t)
+		}
+		resp, _, err := m.call(ctx, relayID, "", req)
+		if err != nil || !resp.OK {
+			m.Logger.Debug("Could not collect receipts", "relay", short(relayID), "error", err)
+			continue
+		}
+		for _, r := range resp.Receipts {
+			m.applyReceipt(ctx, list, r, onReceipt)
+		}
 	}
 }
 
-func (m *Manager) onStored(from string, body []byte) {
-	var r protocol.RelayStored
+func (m *Manager) applyReceipt(ctx context.Context, outbox []storage.OutboxEntry, r receiptEntry, onReceipt ReceiptFunc) {
+	// Genuinely signed for us, about that message, by whoever claims to be the signer...
+	signer, err := offline.VerifyReceipt(r.EdPub, r.Sig, r.MsgID, m.Self.ID())
+	if err != nil || signer != r.Signer {
+		return
+	}
+	// ...and that signer is the person we sent it to, under the tag we chose.
+	for _, e := range outbox {
+		if e.Tag == r.Tag && e.MsgID == r.MsgID && e.To == signer {
+			if onReceipt != nil {
+				onReceipt(ctx, r.MsgID, signer)
+			}
+			_ = m.Store.DeleteOutbox(ctx, r.MsgID, signer)
+			return
+		}
+	}
+}
+
+// ---- Forwarder role --------------------------------------------------------------------
+
+func (m *Manager) expireForwards(now time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for k, f := range m.forwards {
+		if now.Sub(f.at) > forwardTTL {
+			delete(m.forwards, k)
+		}
+	}
+}
+
+func (m *Manager) onForward(from string, body []byte) {
+	var f protocol.RelayForward
+	if protocol.Unmarshal(body, &f) != nil || !validWireID(f.ID) {
+		return
+	}
+	fail := func(reason string) {
+		m.background(func(ctx context.Context) {
+			_ = m.Net.SendJSON(ctx, from, protocol.KindRelayForwardReply, protocol.RelayForwardReply{ID: f.ID, Reason: reason})
+		})
+	}
+	switch {
+	case !m.opts.Enabled:
+		fail("this peer does not forward requests")
+		return
+	case !identity.ValidID(f.Relay) || f.Relay == from || f.Relay == m.Self.ID():
+		fail("invalid relay")
+		return
+	case len(f.Sealed) == 0 || len(f.Sealed) > offline.MaxSealed:
+		fail("request size not accepted")
+		return
+	case !m.forwardLimiter.Allow(from):
+		fail("too many requests")
+		return
+	}
+
+	key := f.Relay + "/" + f.ID
+	m.expireForwards(m.now())
+	m.mu.Lock()
+	if len(m.forwards) >= maxPendingForwards {
+		m.mu.Unlock()
+		fail("busy")
+		return
+	}
+	m.forwards[key] = forward{from: from, at: m.now()}
+	m.mu.Unlock()
+
+	m.background(func(ctx context.Context) {
+		err := m.Net.SendJSON(ctx, f.Relay, protocol.KindRelayRequest, protocol.RelayRequest{ID: f.ID, Sealed: f.Sealed})
+		if err != nil {
+			m.mu.Lock()
+			delete(m.forwards, key)
+			m.mu.Unlock()
+			_ = m.Net.SendJSON(ctx, from, protocol.KindRelayForwardReply, protocol.RelayForwardReply{ID: f.ID, Reason: "could not reach that relay"})
+		}
+	})
+}
+
+func (m *Manager) onForwardReply(from string, body []byte) {
+	var r protocol.RelayForwardReply
 	if protocol.Unmarshal(body, &r) != nil {
 		return
 	}
 	m.mu.Lock()
-	w := m.storeWaiters[from+"/"+r.ID] // only the relay we asked can answer
+	w := m.waiters["fwd:"+from+"/"+r.ID] // only the forwarder we asked can answer
 	m.mu.Unlock()
-	if w != nil {
-		select {
-		case w <- r:
-		default:
-		}
+	if w == nil {
+		return
+	}
+	res := result{sealed: r.Sealed}
+	if !r.OK {
+		res.err = errors.New(r.Reason)
+	}
+	select {
+	case w <- res:
+	default:
 	}
 }
 
-// ---- Relay role: hold messages for others ----------------------------------------
+// ---- Relay role ------------------------------------------------------------------------
 
-func (m *Manager) onStore(from string, body []byte) {
-	var req protocol.RelayStore
-	if protocol.Unmarshal(body, &req) != nil || !validWireID(req.ID) {
+func (m *Manager) onRequest(from string, body []byte) {
+	var r protocol.RelayRequest
+	if protocol.Unmarshal(body, &r) != nil || !validWireID(r.ID) || len(r.Sealed) > offline.MaxSealed {
 		return
 	}
-	reply := func(ok bool, reason string) {
-		m.background(func(ctx context.Context) {
-			_ = m.Net.SendJSON(ctx, from, protocol.KindRelayStored, protocol.RelayStored{ID: req.ID, OK: ok, Reason: reason})
-		})
-	}
+	ctx, cancel := context.WithTimeout(context.Background(), opTimeout)
+	defer cancel()
 
+	plain, err := m.Offline.OpenFor(ctx, purposeRequest, r.Sealed)
+	if err != nil {
+		return // not for us, damaged, or from before our signed prekey was replaced
+	}
+	var req request
+	if json.Unmarshal(plain, &req) != nil || len(req.Reply) != 32 {
+		return
+	}
+	// `from` is the submitter: the sender if she came directly, otherwise the
+	// forwarder. We cannot tell which, and do not try.
+	resp := m.handle(ctx, from, req)
+	out, err := json.Marshal(resp)
+	if err != nil {
+		return
+	}
+	sealed, err := offline.SealToKey(req.Reply, purposeReply+"|"+r.ID, out)
+	if err != nil {
+		return
+	}
+	m.background(func(ctx context.Context) {
+		_ = m.Net.SendJSON(ctx, from, protocol.KindRelayResponse, protocol.RelayResponse{ID: r.ID, Sealed: sealed})
+	})
+}
+
+func (m *Manager) handle(ctx context.Context, submitter string, req request) response {
+	switch req.Op {
+	case "store":
+		return m.handleStore(ctx, submitter, req)
+	case "fetch":
+		return m.handleFetch(ctx, req)
+	default:
+		return response{Reason: "unknown request"}
+	}
+}
+
+func (m *Manager) handleStore(ctx context.Context, submitter string, req request) response {
 	switch {
 	case !m.opts.Enabled:
-		reply(false, "this peer does not hold messages for others")
-		return
-	case !identity.ValidID(req.To) || req.To == from:
-		reply(false, "invalid recipient")
-		return
+		return response{Reason: "this peer does not hold messages for others"}
+	case !validWireID(req.ID):
+		return response{Reason: "invalid message"}
+	case !identity.ValidID(req.To) || req.To == submitter:
+		return response{Reason: "invalid recipient"}
 	case req.To == m.Self.ID():
-		reply(false, "that message is for me; send it directly")
-		return
-	case len(req.Blob) == 0 || len(req.Blob) > offline.MaxBlob:
-		reply(false, "message size not accepted")
-		return
+		return response{Reason: "that message is for me; send it directly"}
+	case len(req.Blob) == 0 || len(req.Blob) > offline.MaxSealed:
+		return response{Reason: "message size not accepted"}
 	}
 
 	now := m.now()
@@ -469,27 +837,68 @@ func (m *Manager) onStore(from string, body []byte) {
 		expires = now.Add(minTTL)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), opTimeout)
-	defer cancel()
 	err := m.Store.PutEnvelope(ctx, storage.RelayEnvelope{
-		ID: req.ID, From: from, To: req.To, Blob: req.Blob, Created: now, Expires: expires,
+		ID: req.ID, Submitter: submitter, To: req.To, Blob: req.Blob, Created: now, Expires: expires,
 	}, m.opts.limits())
 	var quota *storage.QuotaError
 	switch {
 	case errors.As(err, &quota):
-		reply(false, quota.Reason)
-		return
+		return response{Reason: quota.Reason}
 	case err != nil:
 		m.Logger.Warn("Could not store a message for relaying", "error", err)
-		reply(false, "internal error")
-		return
+		return response{Reason: "internal error"}
 	}
-	reply(true, "")
 
 	// If the recipient is connected to us right now, pass it on immediately.
 	if m.Net.IsConnected(req.To) {
 		to := req.To
 		m.background(func(ctx context.Context) { m.deliverHeld(ctx, to) })
+	}
+	return response{OK: true}
+}
+
+func (m *Manager) handleFetch(ctx context.Context, req request) response {
+	var tags []string
+	for _, t := range req.Tags {
+		if validWireID(t) && len(tags) < maxFetchTags {
+			tags = append(tags, t)
+		}
+	}
+	recs, err := m.Store.ReceiptsForTags(ctx, tags, m.now(), maxFetchTags)
+	if err != nil {
+		return response{Reason: "internal error"}
+	}
+	resp := response{OK: true}
+	for _, r := range recs {
+		resp.Receipts = append(resp.Receipts, receiptEntry{Tag: r.Tag, MsgID: r.MsgID, Signer: r.Signer, EdPub: r.EdPub, Sig: r.Sig})
+	}
+	return resp
+}
+
+// onResponse routes an answer from a relay: back to the peer that asked us to
+// forward the request, or to our own waiting call.
+func (m *Manager) onResponse(from string, body []byte) {
+	var r protocol.RelayResponse
+	if protocol.Unmarshal(body, &r) != nil || !validWireID(r.ID) {
+		return
+	}
+	key := from + "/" + r.ID // only the relay we sent the request to can answer
+	m.mu.Lock()
+	fw, forwarding := m.forwards[key]
+	delete(m.forwards, key)
+	w := m.waiters["direct:"+key]
+	m.mu.Unlock()
+
+	switch {
+	case forwarding:
+		m.background(func(ctx context.Context) {
+			_ = m.Net.SendJSON(ctx, fw.from, protocol.KindRelayForwardReply, protocol.RelayForwardReply{ID: r.ID, OK: true, Sealed: r.Sealed})
+		})
+	case w != nil:
+		select {
+		case w <- result{sealed: r.Sealed}:
+		default:
+		}
 	}
 }
 
@@ -501,31 +910,17 @@ func (m *Manager) deliverHeld(ctx context.Context, peerID string) {
 		return
 	}
 	for _, e := range envs {
-		d := protocol.RelayDeliver{ID: e.ID, From: e.From, Blob: e.Blob, Created: e.Created.UnixMilli()}
+		d := protocol.RelayDeliver{ID: e.ID, Blob: e.Blob, Created: e.Created.UnixMilli()}
 		if err := m.Net.SendJSON(ctx, peerID, protocol.KindRelayDeliver, d); err != nil {
 			return // they went away; the rest waits for next time
 		}
 	}
 }
 
-// deliverReceipts hands a sender the receipts we hold for them.
-func (m *Manager) deliverReceipts(ctx context.Context, peerID string) {
-	recs, err := m.Store.ReceiptsFor(ctx, peerID, m.now(), receiptBatch)
-	if err != nil {
-		return
-	}
-	for _, r := range recs {
-		fr := protocol.RelayReceipt{MsgID: r.MsgID, Signer: r.Signer, EdPub: r.EdPub, Sig: r.Sig}
-		if err := m.Net.SendJSON(ctx, peerID, protocol.KindRelayReceipt, fr); err != nil {
-			return
-		}
-		_ = m.Store.DeleteReceipt(ctx, r.To, r.MsgID, r.Signer)
-	}
-}
-
 // onAck: the recipient has dealt with an envelope. Only the addressee can
-// acknowledge (the store enforces it), and a receipt is kept only if it is
-// genuinely signed by that recipient.
+// acknowledge (the store enforces it). Its receipt is filed under the mailbox
+// tag it found inside the message; we cannot verify the receipt (we do not
+// know who wrote the message) and do not need to: the sender will.
 func (m *Manager) onAck(from string, body []byte) {
 	var a protocol.RelayAck
 	if protocol.Unmarshal(body, &a) != nil || !validWireID(a.ID) {
@@ -533,28 +928,19 @@ func (m *Manager) onAck(from string, body []byte) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), opTimeout)
 	defer cancel()
-	env, err := m.Store.TakeEnvelope(ctx, a.ID, from)
-	if err != nil {
+	if _, err := m.Store.TakeEnvelope(ctx, a.ID, from); err != nil {
 		return
 	}
-	if !a.Delivered || !validWireID(a.MsgID) {
+	if !a.Delivered || !validWireID(a.MsgID) || !validWireID(a.Tag) || len(a.Sig) == 0 ||
+		len(a.EdPub) == 0 || identity.PeerIDFromPublicKey(a.EdPub) != from {
 		return
 	}
-	signer, err := offline.VerifyReceipt(a.EdPub, a.Sig, a.MsgID, env.From)
-	if err != nil || signer != from {
-		return
-	}
-	rec := storage.RelayReceipt{To: env.From, MsgID: a.MsgID, Signer: from, EdPub: a.EdPub, Sig: a.Sig, Expires: m.now().Add(MaxTTL)}
-	if err := m.Store.PutReceipt(ctx, rec, m.opts.limits()); err != nil {
-		return
-	}
-	if m.Net.IsConnected(env.From) {
-		to := env.From
-		m.background(func(ctx context.Context) { m.deliverReceipts(ctx, to) })
-	}
+	_ = m.Store.PutReceipt(ctx, storage.RelayReceipt{
+		Tag: a.Tag, MsgID: a.MsgID, Signer: from, EdPub: a.EdPub, Sig: a.Sig, Expires: m.now().Add(MaxTTL),
+	}, m.opts.limits())
 }
 
-// ---- Recipient role ----------------------------------------------------------------
+// ---- Recipient role ----------------------------------------------------------------------
 
 func (m *Manager) onDeliver(from string, body []byte) {
 	var d protocol.RelayDeliver
@@ -568,23 +954,24 @@ func (m *Manager) onDeliver(from string, body []byte) {
 	ctx, cancel := context.WithTimeout(context.Background(), opTimeout)
 	defer cancel()
 
-	var msgID string
+	var msgID, tag string
 	_, sender, err := m.Offline.OpenThen(ctx, d.Blob, func(plain []byte, senderID string) error {
-		if onMessage == nil {
-			return errRejects
+		var w wrapped
+		if onMessage == nil || json.Unmarshal(plain, &w) != nil {
+			return errRejected
 		}
-		id, ok := onMessage(ctx, senderID, plain)
+		id, ok := onMessage(ctx, senderID, w.Payload)
 		if !ok {
-			return errRejects
+			return errRejected
 		}
-		msgID = id
+		msgID, tag = id, w.Tag
 		return nil
 	})
 
 	ack := protocol.RelayAck{ID: d.ID}
 	switch {
 	case err == nil:
-		ack.Delivered, ack.MsgID = true, msgID
+		ack.Delivered, ack.MsgID, ack.Tag = true, msgID, tag
 		ack.EdPub, ack.Sig = m.Self.PublicKey(), offline.SignReceipt(m.Self, msgID, sender)
 	case errors.Is(err, offline.ErrNoPrekey):
 		// Usually a second copy of a message we already opened (the sender
@@ -595,28 +982,4 @@ func (m *Manager) onDeliver(from string, body []byte) {
 	m.background(func(ctx context.Context) {
 		_ = m.Net.SendJSON(ctx, from, protocol.KindRelayAck, ack)
 	})
-}
-
-// ---- Sender role: receipts ---------------------------------------------------------
-
-func (m *Manager) onReceiptFrame(from string, body []byte) {
-	var r protocol.RelayReceipt
-	if protocol.Unmarshal(body, &r) != nil || !validWireID(r.MsgID) {
-		return
-	}
-	// The receipt is addressed to us, so it must be signed for our ID.
-	signer, err := offline.VerifyReceipt(r.EdPub, r.Sig, r.MsgID, m.Self.ID())
-	if err != nil || signer != r.Signer {
-		m.Logger.Debug("Ignored an invalid delivery receipt", "relay", short(from))
-		return
-	}
-	m.mu.Lock()
-	onReceipt := m.onReceipt
-	m.mu.Unlock()
-	if onReceipt == nil {
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), opTimeout)
-	defer cancel()
-	onReceipt(ctx, r.MsgID, signer)
 }

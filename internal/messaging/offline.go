@@ -14,18 +14,28 @@ import (
 
 // Relayer hands an end-to-end encrypted copy of a message to peers that will
 // hold it for an offline recipient (implemented by package relay). It returns
-// how many agreed to.
+// how many agreed to and how many of them could see who the sender was.
+// msgID names the message in the delivery receipt.
 type Relayer interface {
-	Dispatch(ctx context.Context, to string, plaintext []byte) (int, error)
+	Dispatch(ctx context.Context, to, msgID string, plaintext []byte) (models.RelayResult, error)
 }
 
 // QueuedError is returned by SendMessage when the recipient could not be
 // reached but the message was safely queued with relays. It is not a failure:
 // the message will be delivered when the recipient next comes online.
-type QueuedError struct{ Relays int }
+type QueuedError struct {
+	Relays int
+	// Exposed is how many relays saw who the sender was (no third peer was
+	// available to forward the request anonymously).
+	Exposed int
+}
 
 func (e *QueuedError) Error() string {
-	return fmt.Sprintf("recipient is offline; message queued with %d relay(s) for delivery when they return", e.Relays)
+	s := fmt.Sprintf("recipient is offline; message queued with %d relay(s) for delivery when they return", e.Relays)
+	if e.Exposed > 0 {
+		s += fmt.Sprintf(" (%d of them could see that it is from you: too few peers connected to hide it)", e.Exposed)
+	}
+	return s
 }
 
 // IsQueued reports whether err is a QueuedError.
@@ -52,15 +62,15 @@ type relayedPayload struct {
 }
 
 // relayCopy encrypts msg for its recipient and hands it to relays.
-func (h *Handler) relayCopy(ctx context.Context, to string, msg *models.ChatMessage) (int, error) {
+func (h *Handler) relayCopy(ctx context.Context, to string, msg *models.ChatMessage) (models.RelayResult, error) {
 	if h.Relay == nil {
-		return 0, errors.New("offline delivery is not available")
+		return models.RelayResult{}, errors.New("offline delivery is not available")
 	}
 	plain, err := json.Marshal(relayedPayload{ChatMessage: msg, SenderName: h.SelfName})
 	if err != nil {
-		return 0, err
+		return models.RelayResult{}, err
 	}
-	return h.Relay.Dispatch(ctx, to, plain)
+	return h.Relay.Dispatch(ctx, to, msg.ID, plain)
 }
 
 // relayPending hands our undelivered, not-yet-relayed direct messages for a

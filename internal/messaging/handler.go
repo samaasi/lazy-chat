@@ -317,12 +317,12 @@ func (h *Handler) SendMessage(ctx context.Context, peerID, content string) error
 	}
 	if err := h.Net.SendJSON(ctx, peerID, protocol.KindMessage, msg); err != nil {
 		// Unreachable: ask other peers to hold an encrypted copy for them.
-		n, rerr := h.relayCopy(ctx, peerID, msg)
+		res, rerr := h.relayCopy(ctx, peerID, msg)
 		if rerr != nil {
 			return fmt.Errorf("message saved but not delivered: %w", err)
 		}
 		_ = h.Store.MarkMessageRelayed(ctx, h.SelfID, msg.ID)
-		return &QueuedError{Relays: n}
+		return &QueuedError{Relays: res.Relays, Exposed: res.Exposed}
 	}
 	return nil
 }

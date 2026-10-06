@@ -162,6 +162,13 @@ func plain(id, text string) []byte {
 	return b
 }
 
+// send queues a message through whichever relays n can reach, returning how
+// many agreed to hold it.
+func send(n *node, to, id, text string) (int, error) {
+	res, err := n.mgr.Dispatch(bg, to, id, plain(id, text))
+	return res.Relays, err
+}
+
 func held(n *node) int { c, _, _ := n.db.RelayUsage(bg); return c }
 
 var relayOn = Options{Enabled: true, StoreTimeout: 3 * time.Second, BundleTimeout: 2 * time.Second}
@@ -179,7 +186,7 @@ func TestMessageReachesAnOfflineRecipientThroughARelay(t *testing.T) {
 
 	// Alice sends to Bob while he is offline; Carol is the only peer she can reach.
 	alice.connect(carol)
-	n, err := alice.mgr.Dispatch(bg, bob.id.ID(), plain("m1", "see you tomorrow"))
+	n, err := send(alice, bob.id.ID(), "m1", "see you tomorrow")
 	if err != nil || n != 1 {
 		t.Fatalf("dispatch: %d %v", n, err)
 	}
@@ -218,11 +225,11 @@ func TestRelayHoldsOnlyCiphertext(t *testing.T) {
 	bob.stop()
 	alice.connect(carol)
 	const secret = "the-launch-code-is-0451"
-	if _, err := alice.mgr.Dispatch(bg, bob.id.ID(), plain("m1", secret)); err != nil {
+	if _, err := send(alice, bob.id.ID(), "m1", secret); err != nil {
 		t.Fatal(err)
 	}
 	envs, _ := carol.db.EnvelopesFor(bg, bob.id.ID(), time.Now(), 10)
-	if len(envs) != 1 || envs[0].From != alice.id.ID() {
+	if len(envs) != 1 || envs[0].Submitter != alice.id.ID() {
 		t.Fatalf("envelopes: %+v", envs)
 	}
 	if containsBytes(envs[0].Blob, secret) {
@@ -253,11 +260,11 @@ func TestRecipientConnectedToTheRelayReceivesImmediately(t *testing.T) {
 	bob.connect(carol)
 	alice.connect(carol)
 
-	if _, err := alice.mgr.Dispatch(bg, bob.id.ID(), plain("m1", "via carol")); err != nil {
+	if _, err := send(alice, bob.id.ID(), "m1", "via carol"); err != nil {
 		t.Fatal(err)
 	}
 	eventually(t, "immediate forwarding", func() bool { return len(bob.got()) == 1 })
-	eventually(t, "the receipt to come back", func() bool { return len(alice.gotReceipts()) == 1 })
+	eventually(t, "the receipt to come back", func() bool { alice.mgr.FetchReceipts(bg); return len(alice.gotReceipts()) == 1 })
 }
 
 func TestSeveralRelaysDeliverOnceAndAllClearTheirCopy(t *testing.T) {
@@ -268,7 +275,7 @@ func TestSeveralRelaysDeliverOnceAndAllClearTheirCopy(t *testing.T) {
 	alice.connect(c1)
 	alice.connect(c2)
 
-	n, err := alice.mgr.Dispatch(bg, bob.id.ID(), plain("m1", "twice relayed"))
+	n, err := send(alice, bob.id.ID(), "m1", "twice relayed")
 	if err != nil || n != 2 {
 		t.Fatalf("dispatch: %d %v", n, err)
 	}
@@ -292,7 +299,7 @@ func TestBundleGossipLetsAStrangerEncryptViaAMutualPeer(t *testing.T) {
 		t.Fatal("setup: Alice must not know Bob yet")
 	}
 
-	if n, err := alice.mgr.Dispatch(bg, bob.id.ID(), plain("m1", "hello stranger")); err != nil || n != 1 {
+	if n, err := send(alice, bob.id.ID(), "m1", "hello stranger"); err != nil || n != 1 {
 		t.Fatalf("dispatch: %d %v", n, err)
 	}
 	bob.start()
@@ -307,27 +314,27 @@ func TestDispatchFailureModes(t *testing.T) {
 	alice, bob, carol := newNode(t, "alice", relayOn), newNode(t, "bob", relayOn), newNode(t, "carol", Options{Enabled: false, StoreTimeout: 2 * time.Second})
 
 	// Never met Bob and nobody to ask.
-	if _, err := alice.mgr.Dispatch(bg, bob.id.ID(), plain("m", "x")); err == nil {
+	if _, err := send(alice, bob.id.ID(), "m", "x"); err == nil {
 		t.Fatal("dispatched without a bundle and without peers")
 	}
 	alice.connect(bob)
 	bob.stop()
 	// Knows Bob's bundle, but is connected to nobody.
-	if _, err := alice.mgr.Dispatch(bg, bob.id.ID(), plain("m", "x")); !errors.Is(err, ErrNoPeers) {
+	if _, err := send(alice, bob.id.ID(), "m", "x"); !errors.Is(err, ErrNoPeers) {
 		t.Fatalf("no peers: %v", err)
 	}
 	// The only connected peer refuses to relay.
 	alice.connect(carol)
-	if _, err := alice.mgr.Dispatch(bg, bob.id.ID(), plain("m", "x")); !errors.Is(err, ErrNoRelay) {
+	if _, err := send(alice, bob.id.ID(), "m", "x"); !errors.Is(err, ErrNoRelay) {
 		t.Fatalf("relay disabled: %v", err)
 	}
 	if held(carol) != 0 {
 		t.Fatal("a peer with relaying switched off stored a message")
 	}
-	if _, err := alice.mgr.Dispatch(bg, "not-an-id", plain("m", "x")); err == nil {
+	if _, err := send(alice, "not-an-id", "m", "x"); err == nil {
 		t.Fatal("bad recipient accepted")
 	}
-	if _, err := alice.mgr.Dispatch(bg, alice.id.ID(), plain("m", "x")); err == nil {
+	if _, err := send(alice, alice.id.ID(), "m", "x"); err == nil {
 		t.Fatal("dispatch to ourselves accepted")
 	}
 }
@@ -346,7 +353,7 @@ func TestRelayEnforcesQuotasPerSender(t *testing.T) {
 
 	accepted := 0
 	for i := range 6 {
-		if n, err := mallory.mgr.Dispatch(bg, bob.id.ID(), plain(fmt.Sprintf("s%d", i), "spam")); err == nil && n > 0 {
+		if n, err := send(mallory, bob.id.ID(), fmt.Sprintf("s%d", i), "spam"); err == nil && n > 0 {
 			accepted++
 		}
 	}
@@ -354,7 +361,7 @@ func TestRelayEnforcesQuotasPerSender(t *testing.T) {
 		t.Fatalf("the relay accepted %d of Mallory's 6 messages; the per-sender limit is 3", accepted)
 	}
 	// Mallory's spam does not stop Alice using the same relay.
-	if n, err := alice.mgr.Dispatch(bg, bob.id.ID(), plain("a1", "legit")); err != nil || n != 1 {
+	if n, err := send(alice, bob.id.ID(), "a1", "legit"); err != nil || n != 1 {
 		t.Fatalf("an unrelated sender was blocked: %d %v", n, err)
 	}
 	if held(carol) != 4 {
@@ -367,14 +374,14 @@ func TestOnlyTheRecipientCanAcknowledgeAnEnvelope(t *testing.T) {
 	alice.connect(bob)
 	bob.stop()
 	alice.connect(carol)
-	if _, err := alice.mgr.Dispatch(bg, bob.id.ID(), plain("m1", "for Bob")); err != nil {
+	if _, err := send(alice, bob.id.ID(), "m1", "for Bob"); err != nil {
 		t.Fatal(err)
 	}
 	envs, _ := carol.db.EnvelopesFor(bg, bob.id.ID(), time.Now(), 5)
 
 	// Dave (connected to the relay) tries to delete Bob's envelope and plant a receipt.
 	dave.connect(carol)
-	forged := protocol.RelayAck{ID: envs[0].ID, Delivered: true, MsgID: "m1", EdPub: dave.id.PublicKey(), Sig: offline.SignReceipt(dave.id, "m1", alice.id.ID())}
+	forged := protocol.RelayAck{ID: envs[0].ID, Delivered: true, MsgID: "m1", Tag: "tag1", EdPub: dave.id.PublicKey(), Sig: offline.SignReceipt(dave.id, "m1", alice.id.ID())}
 	if err := dave.net.SendJSON(bg, carol.id.ID(), protocol.KindRelayAck, forged); err != nil {
 		t.Fatal(err)
 	}
@@ -382,35 +389,53 @@ func TestOnlyTheRecipientCanAcknowledgeAnEnvelope(t *testing.T) {
 	if held(carol) != 1 {
 		t.Fatal("someone other than the recipient deleted the envelope")
 	}
-	if r, _ := carol.db.ReceiptsFor(bg, alice.id.ID(), time.Now(), 5); len(r) != 0 {
+	if r, _ := carol.db.ReceiptsForTags(bg, []string{"tag1"}, time.Now(), 5); len(r) != 0 {
 		t.Fatal("a receipt from a non-recipient was stored")
 	}
 }
 
 func TestARelayCannotForgeADeliveryReceipt(t *testing.T) {
-	alice, mallory := newNode(t, "alice", relayOn), newNode(t, "mallory", relayOn)
-	bob := newNode(t, "bob", relayOn)
-	mallory.connect(alice)
+	alice, bob, mallory, carol := newNode(t, "alice", relayOn), newNode(t, "bob", relayOn), newNode(t, "mallory", relayOn), newNode(t, "carol", relayOn)
+	alice.connect(carol)
+	// Alice queued a message to Bob under a tag only she and Bob know.
+	const tag = "tag-for-m1"
+	_ = alice.db.AddOutbox(bg, storage.OutboxEntry{MsgID: "m1", RelayID: carol.id.ID(), To: bob.id.ID(), Tag: tag, Created: time.Now()})
 
-	send := func(r protocol.RelayReceipt) {
-		if err := mallory.net.SendJSON(bg, alice.id.ID(), protocol.KindRelayReceipt, r); err != nil {
+	put := func(r storage.RelayReceipt) {
+		r.Tag, r.Expires = tag, time.Now().Add(time.Hour)
+		if err := carol.db.PutReceipt(bg, r, storage.RelayLimits{}); err != nil {
 			t.Fatal(err)
 		}
 	}
 	// A made-up signature "from Bob".
-	send(protocol.RelayReceipt{MsgID: "m1", Signer: bob.id.ID(), EdPub: bob.id.PublicKey(), Sig: make([]byte, 64)})
-	// Bob's genuine signature, but for a different sender (replayed from another conversation).
-	send(protocol.RelayReceipt{MsgID: "m1", Signer: bob.id.ID(), EdPub: bob.id.PublicKey(), Sig: offline.SignReceipt(bob.id, "m1", mallory.id.ID())})
-	// Mallory's own genuine receipt, but claiming to be Bob's.
-	send(protocol.RelayReceipt{MsgID: "m1", Signer: bob.id.ID(), EdPub: mallory.id.PublicKey(), Sig: offline.SignReceipt(mallory.id, "m1", alice.id.ID())})
-	never(t, "a forged receipt reaching the application", 400*time.Millisecond, func() bool { return len(alice.gotReceipts()) > 0 })
+	put(storage.RelayReceipt{MsgID: "m1", Signer: bob.id.ID(), EdPub: bob.id.PublicKey(), Sig: make([]byte, 64)})
+	// Bob's genuine signature, but made for a different sender (replayed from another conversation).
+	put(storage.RelayReceipt{MsgID: "m1", Signer: bob.id.ID(), EdPub: bob.id.PublicKey(), Sig: offline.SignReceipt(bob.id, "m1", mallory.id.ID())})
+	// Mallory's own genuine receipt, claiming to be Bob's.
+	put(storage.RelayReceipt{MsgID: "m1", Signer: bob.id.ID(), EdPub: mallory.id.PublicKey(), Sig: offline.SignReceipt(mallory.id, "m1", alice.id.ID())})
+	// Mallory's genuine receipt under her own name: valid, but she is not who Alice wrote to.
+	put(storage.RelayReceipt{MsgID: "m1", Signer: mallory.id.ID(), EdPub: mallory.id.PublicKey(), Sig: offline.SignReceipt(mallory.id, "m1", alice.id.ID())})
+	// Bob's genuine receipt for another message of Alice's.
+	put(storage.RelayReceipt{MsgID: "other", Signer: bob.id.ID(), EdPub: bob.id.PublicKey(), Sig: offline.SignReceipt(bob.id, "other", alice.id.ID())})
 
-	// A genuine receipt signed by Mallory is passed on truthfully attributed to
-	// Mallory, so the caller can see she is not the recipient.
-	send(protocol.RelayReceipt{MsgID: "m2", Signer: mallory.id.ID(), EdPub: mallory.id.PublicKey(), Sig: offline.SignReceipt(mallory.id, "m2", alice.id.ID())})
-	eventually(t, "the honest-signer receipt", func() bool { return len(alice.gotReceipts()) == 1 })
-	if r := alice.gotReceipts()[0]; r.signer != mallory.id.ID() {
-		t.Fatalf("signer misreported: %+v", r)
+	alice.mgr.FetchReceipts(bg)
+	if got := alice.gotReceipts(); len(got) != 0 {
+		t.Fatalf("a forged or misattributed receipt reached the application: %+v", got)
+	}
+	if o, _ := alice.db.Outbox(bg, time.Time{}); len(o) != 1 {
+		t.Fatal("the outbox entry was cleared by a bad receipt")
+	}
+
+	// Bob's genuine receipt for a message she did queue is accepted, once.
+	_ = alice.db.AddOutbox(bg, storage.OutboxEntry{MsgID: "m2", RelayID: carol.id.ID(), To: bob.id.ID(), Tag: tag, Created: time.Now()})
+	put(storage.RelayReceipt{MsgID: "m2", Signer: bob.id.ID(), EdPub: bob.id.PublicKey(), Sig: offline.SignReceipt(bob.id, "m2", alice.id.ID())})
+	alice.mgr.FetchReceipts(bg)
+	if got := alice.gotReceipts(); len(got) != 1 || got[0].signer != bob.id.ID() || got[0].msgID != "m2" {
+		t.Fatalf("receipts: %+v", got)
+	}
+	alice.mgr.FetchReceipts(bg)
+	if len(alice.gotReceipts()) != 1 {
+		t.Fatal("a receipt was applied twice")
 	}
 }
 
@@ -419,17 +444,24 @@ func TestMalformedRelayTrafficIsIgnored(t *testing.T) {
 	alice.connect(carol)
 	bobID := "0123456789abcdef0123456789abcdef"
 
-	bad := []protocol.RelayStore{
+	bad := []request{
 		{ID: "../x", To: bobID, Blob: []byte("x")},
 		{ID: "ok1", To: "nope", Blob: []byte("x")},
 		{ID: "ok2", To: alice.id.ID(), Blob: []byte("x")}, // to the sender
 		{ID: "ok3", To: carol.id.ID(), Blob: []byte("x")}, // to the relay itself
 		{ID: "ok4", To: bobID, Blob: nil},
-		{ID: "ok5", To: bobID, Blob: make([]byte, offline.MaxBlob+1)},
+		{ID: "ok5", To: bobID, Blob: make([]byte, offline.MaxSealed+1)},
 	}
 	for _, r := range bad {
-		_ = alice.net.SendJSON(bg, carol.id.ID(), protocol.KindRelayStore, r)
+		r.Op = "store"
+		if resp, _, err := alice.mgr.call(bg, carol.id.ID(), "", r); err == nil && resp.OK {
+			t.Errorf("accepted %q", r.ID)
+		}
 	}
+	// Frames that are not even requests.
+	_ = alice.net.SendJSON(bg, carol.id.ID(), protocol.KindRelayRequest, protocol.RelayRequest{ID: "g1", Sealed: []byte("garbage")})
+	_ = alice.net.SendJSON(bg, carol.id.ID(), protocol.KindRelayRequest, protocol.RelayRequest{ID: "../bad", Sealed: []byte("x")})
+	_ = alice.net.SendJSON(bg, carol.id.ID(), protocol.KindRelayDeliver, protocol.RelayDeliver{ID: "d1", Blob: []byte("x")}) // not a relay's job
 	time.Sleep(400 * time.Millisecond)
 	if held(carol) != 0 {
 		t.Fatalf("carol stored %d malformed messages", held(carol))
@@ -439,7 +471,7 @@ func TestMalformedRelayTrafficIsIgnored(t *testing.T) {
 	// the relay does not keep it forever.
 	bob := newNode(t, "bob", relayOn)
 	carol.connect(bob)
-	junk := storage.RelayEnvelope{ID: "junk1", From: alice.id.ID(), To: bob.id.ID(), Blob: []byte(`{"v":1}`), Created: time.Now(), Expires: time.Now().Add(time.Hour)}
+	junk := storage.RelayEnvelope{ID: "junk1", Submitter: alice.id.ID(), To: bob.id.ID(), Blob: []byte(`{"v":1}`), Created: time.Now(), Expires: time.Now().Add(time.Hour)}
 	_ = carol.db.PutEnvelope(bg, junk, storage.RelayLimits{})
 	carol.mgr.deliverHeld(bg, bob.id.ID())
 	eventually(t, "the relay to drop an undecryptable envelope", func() bool { return held(carol) == 0 })
@@ -453,7 +485,7 @@ func TestExpiredEnvelopesAreNotDeliveredAndArePurged(t *testing.T) {
 	alice.connect(bob)
 	bob.stop()
 	alice.connect(carol)
-	if _, err := alice.mgr.Dispatch(bg, bob.id.ID(), plain("m1", "too late")); err != nil {
+	if _, err := send(alice, bob.id.ID(), "m1", "too late"); err != nil {
 		t.Fatal(err)
 	}
 	carol.mgr.now = func() time.Time { return time.Now().Add(MaxTTL + time.Hour) }
@@ -473,7 +505,7 @@ func TestUsageReporting(t *testing.T) {
 	alice.connect(bob)
 	bob.stop()
 	alice.connect(carol)
-	_, _ = alice.mgr.Dispatch(bg, bob.id.ID(), plain("m1", "x"))
+	_, _ = send(alice, bob.id.ID(), "m1", "x")
 	n, bytes, capacity, err := carol.mgr.Usage(bg)
 	if err != nil || n != 1 || bytes == 0 || capacity != DefaultMaxStorage {
 		t.Fatalf("usage: %d %d %d %v", n, bytes, capacity, err)

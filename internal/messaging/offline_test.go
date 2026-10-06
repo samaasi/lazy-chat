@@ -27,22 +27,22 @@ type fakeRelay struct {
 	n     int
 }
 
-func (f *fakeRelay) Dispatch(_ context.Context, to string, plaintext []byte) (int, error) {
+func (f *fakeRelay) Dispatch(_ context.Context, to, _ string, plaintext []byte) (models.RelayResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.errTo[to]; err != nil {
-		return 0, err
+		return models.RelayResult{}, err
 	}
 	if f.err != nil {
-		return 0, f.err
+		return models.RelayResult{}, f.err
 	}
 	var m models.ChatMessage
 	_ = json.Unmarshal(plaintext, &m)
 	f.calls = append(f.calls, dispatched{to: to, text: m.Message, id: m.ID})
 	if f.n == 0 {
-		return 1, nil
+		return models.RelayResult{Relays: 1}, nil
 	}
-	return f.n, nil
+	return models.RelayResult{Relays: f.n}, nil
 }
 
 func (f *fakeRelay) to(peer string) []dispatched {
@@ -275,7 +275,10 @@ func TestSendersNameTravelsWithARelayedMessage(t *testing.T) {
 func TestOutgoingRelayedPayloadCarriesOurName(t *testing.T) {
 	e := newEnv(t, 1, "Me Myself")
 	var payload []byte
-	e.h.Relay = relayFunc(func(_ context.Context, _ string, p []byte) (int, error) { payload = p; return 1, nil })
+	e.h.Relay = relayFunc(func(_ context.Context, _ string, p []byte) (models.RelayResult, error) {
+		payload = p
+		return models.RelayResult{Relays: 1}, nil
+	})
 	bob := pid(2)
 	e.net.failFor[bob] = errors.New("offline")
 	if !IsQueued(e.h.SendMessage(bg, bob, "hi")) {
@@ -286,9 +289,9 @@ func TestOutgoingRelayedPayloadCarriesOurName(t *testing.T) {
 	}
 }
 
-type relayFunc func(context.Context, string, []byte) (int, error)
+type relayFunc func(context.Context, string, []byte) (models.RelayResult, error)
 
-func (f relayFunc) Dispatch(ctx context.Context, to string, p []byte) (int, error) {
+func (f relayFunc) Dispatch(ctx context.Context, to, _ string, p []byte) (models.RelayResult, error) {
 	return f(ctx, to, p)
 }
 
@@ -389,5 +392,14 @@ func TestGroupReceiptsMustComeFromMembers(t *testing.T) {
 	e.h.ApplyReceipt(bg, id, bob)
 	if !e.stored(t)[0].Delivered {
 		t.Fatal("a member's receipt was ignored")
+	}
+}
+
+func TestQueuedErrorMentionsExposure(t *testing.T) {
+	if s := (&QueuedError{Relays: 2}).Error(); strings.Contains(s, "see that it is from you") {
+		t.Fatalf("no exposure, but warned: %s", s)
+	}
+	if s := (&QueuedError{Relays: 2, Exposed: 1}).Error(); !strings.Contains(s, "1 of them could see that it is from you") {
+		t.Fatalf("exposure not reported: %s", s)
 	}
 }
