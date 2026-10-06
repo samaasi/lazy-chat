@@ -1,6 +1,7 @@
 package errors
 
 import (
+	"errors"
 	"fmt"
 )
 
@@ -29,7 +30,7 @@ type AppError struct {
 // Error implements the error interface
 func (e *AppError) Error() string {
 	if e.Cause != nil {
-		return fmt.Sprintf("%s [%s:%s]: %s (caused by: %v)", e.Type, e.Code, e.Message, e.Message, e.Cause)
+		return fmt.Sprintf("%s [%s]: %s (caused by: %v)", e.Type, e.Code, e.Message, e.Cause)
 	}
 	return fmt.Sprintf("%s [%s]: %s", e.Type, e.Code, e.Message)
 }
@@ -39,13 +40,24 @@ func (e *AppError) Unwrap() error {
 	return e.Cause
 }
 
-// WithContext adds context information to the error
+// Is reports whether target is an AppError with the same code, so that
+// errors.Is(err, ErrPeerNotFound) keeps working on derived copies.
+func (e *AppError) Is(target error) bool {
+	t, ok := target.(*AppError)
+	return ok && t.Code == e.Code && t.Type == e.Type
+}
+
+// WithContext returns a copy of the error with the extra context attached.
+// The receiver is never modified: the package-level Err* values are shared
+// by every goroutine, so mutating them would be a data race.
 func (e *AppError) WithContext(key string, value interface{}) *AppError {
-	if e.Context == nil {
-		e.Context = make(map[string]interface{})
+	clone := *e
+	clone.Context = make(map[string]interface{}, len(e.Context)+1)
+	for k, v := range e.Context {
+		clone.Context[k] = v
 	}
-	e.Context[key] = value
-	return e
+	clone.Context[key] = value
+	return &clone
 }
 
 // New creates a new application error
@@ -88,11 +100,11 @@ var (
 
 // Peer Error Definitions
 var (
-	ErrPeerNotFound       = New(ErrorTypePeer, "PEER001", "peer not found")
-	ErrPeerAlreadyExists  = New(ErrorTypePeer, "PEER002", "peer already exists")
-	ErrPeerNotConnected   = New(ErrorTypePeer, "PEER003", "peer is not connected")
+	ErrPeerNotFound         = New(ErrorTypePeer, "PEER001", "peer not found")
+	ErrPeerAlreadyExists    = New(ErrorTypePeer, "PEER002", "peer already exists")
+	ErrPeerNotConnected     = New(ErrorTypePeer, "PEER003", "peer is not connected")
 	ErrPeerAlreadyConnected = New(ErrorTypePeer, "PEER004", "peer is already connected")
-	ErrPeerInvalidID      = New(ErrorTypePeer, "PEER005", "invalid peer ID")
+	ErrPeerInvalidID        = New(ErrorTypePeer, "PEER005", "invalid peer ID")
 )
 
 // Message Error Definitions
@@ -107,10 +119,10 @@ var (
 
 // Configuration Error Definitions
 var (
-	ErrConfigInvalid     = New(ErrorTypeConfig, "CFG001", "invalid configuration")
-	ErrConfigMissing     = New(ErrorTypeConfig, "CFG002", "required configuration missing")
-	ErrConfigLoadFailed  = New(ErrorTypeConfig, "CFG003", "failed to load configuration")
-	ErrConfigValidation  = New(ErrorTypeConfig, "CFG004", "configuration validation failed")
+	ErrConfigInvalid    = New(ErrorTypeConfig, "CFG001", "invalid configuration")
+	ErrConfigMissing    = New(ErrorTypeConfig, "CFG002", "required configuration missing")
+	ErrConfigLoadFailed = New(ErrorTypeConfig, "CFG003", "failed to load configuration")
+	ErrConfigValidation = New(ErrorTypeConfig, "CFG004", "configuration validation failed")
 )
 
 // Application Error Definitions
@@ -140,48 +152,36 @@ func NewFileTransferError(message string, cause error) *AppError {
 
 // IsNetworkError checks if an error is a network-related error
 func IsNetworkError(err error) bool {
-	if appErr, ok := err.(*AppError); ok {
-		return appErr.Type == ErrorTypeNetwork
-	}
-	return false
+	return hasType(err, ErrorTypeNetwork)
 }
 
 // IsDiscoveryError checks if an error is a discovery-related error
 func IsDiscoveryError(err error) bool {
-	if appErr, ok := err.(*AppError); ok {
-		return appErr.Type == ErrorTypeDiscovery
-	}
-	return false
+	return hasType(err, ErrorTypeDiscovery)
 }
 
 // IsPeerError checks if an error is a peer-related error
 func IsPeerError(err error) bool {
-	if appErr, ok := err.(*AppError); ok {
-		return appErr.Type == ErrorTypePeer
-	}
-	return false
+	return hasType(err, ErrorTypePeer)
 }
 
 // IsMessageError checks if an error is a message-related error
 func IsMessageError(err error) bool {
-	if appErr, ok := err.(*AppError); ok {
-		return appErr.Type == ErrorTypeMessage
-	}
-	return false
+	return hasType(err, ErrorTypeMessage)
 }
 
 // IsConfigError checks if an error is a configuration-related error
 func IsConfigError(err error) bool {
-	if appErr, ok := err.(*AppError); ok {
-		return appErr.Type == ErrorTypeConfig
-	}
-	return false
+	return hasType(err, ErrorTypeConfig)
 }
 
 // IsApplicationError checks if an error is an application-related error
 func IsApplicationError(err error) bool {
-	if appErr, ok := err.(*AppError); ok {
-		return appErr.Type == ErrorTypeApplication
-	}
-	return false
+	return hasType(err, ErrorTypeApplication)
+}
+
+// hasType reports whether err (or anything it wraps) is an AppError of the given type.
+func hasType(err error, t ErrorType) bool {
+	var appErr *AppError
+	return errors.As(err, &appErr) && appErr.Type == t
 }
