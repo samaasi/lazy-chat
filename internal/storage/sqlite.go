@@ -26,13 +26,33 @@ const (
 // compares correctly in SQL regardless of time zone, and round-trips without
 // any text-format parsing.
 type SQLiteDB struct {
-	db   *sql.DB
-	path string
+	db    *sql.DB
+	path  string
+	vault Sealer // nil: sensitive fields are stored in the clear
 }
 
+// Sealer encrypts sensitive fields at rest (implemented by vault.Vault).
+type Sealer interface {
+	Seal(plaintext []byte, aad string) string
+	Open(sealed, aad string) ([]byte, error)
+}
+
+// Option customises a SQLiteDB.
+type Option func(*SQLiteDB)
+
+// WithVault turns on encryption at rest: message text, group names and
+// descriptions, member names and invitation contents are stored encrypted.
+// Identifiers, timestamps and delivery flags stay in the clear so they can be
+// indexed and queried.
+func WithVault(v Sealer) Option { return func(s *SQLiteDB) { s.vault = v } }
+
 // NewSQLiteDB creates a new SQLite database instance
-func NewSQLiteDB(path string) *SQLiteDB {
-	return &SQLiteDB{path: path}
+func NewSQLiteDB(path string, opts ...Option) *SQLiteDB {
+	s := &SQLiteDB{path: path}
+	for _, o := range opts {
+		o(s)
+	}
+	return s
 }
 
 // dsn builds a file: URI that applies the pragmas to every pooled connection
@@ -171,6 +191,12 @@ var migrations = [][]string{
 		`CREATE INDEX idx_msg_undelivered ON messages (to_peer_id, seq)
 			WHERE delivered = 0 AND deleted_at IS NULL AND message_type = 'direct'`,
 	},
+	{ // 3: small key/value table (records whether the data is encrypted)
+		`CREATE TABLE meta (
+			key   TEXT PRIMARY KEY,
+			value TEXT NOT NULL
+		)`,
+	},
 }
 
 // legacyTables are the tables of the two incompatible schemas older versions
@@ -210,7 +236,10 @@ func (s *SQLiteDB) Migrate(ctx context.Context) error {
 	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`PRAGMA user_version = %d`, len(migrations))); err != nil {
 		return fmt.Errorf("failed to record schema version: %w", err)
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	return s.initEncryption(ctx)
 }
 
 // retireLegacySchema renames tables from pre-versioning databases out of the
@@ -300,6 +329,34 @@ func (p Page) normalized() Page {
 	return p
 }
 
+// ---- Encryption helpers ------------------------------------------------------
+
+// seal encrypts a sensitive value (a no-op without a vault). aad ties the
+// ciphertext to its row and column.
+func (s *SQLiteDB) seal(aad, value string) string {
+	if s.vault == nil {
+		return value
+	}
+	return s.vault.Seal([]byte(value), aad)
+}
+
+// open reverses seal.
+func (s *SQLiteDB) open(aad, stored string) (string, error) {
+	if s.vault == nil {
+		return stored, nil
+	}
+	plain, err := s.vault.Open(stored, aad)
+	if err != nil {
+		return "", fmt.Errorf("cannot decrypt stored data: %w", err)
+	}
+	return string(plain), nil
+}
+
+func aadMessage(from, id string) string   { return "messages.content|" + from + "|" + id }
+func aadGroup(field, id string) string    { return "groups." + field + "|" + id }
+func aadMember(group, peer string) string { return "group_members.username|" + group + "|" + peer }
+func aadInvite(field, id string) string   { return "group_invites." + field + "|" + id }
+
 // rowsAffectedOrNotFound maps "0 rows changed" to ErrNotFound.
 func rowsAffectedOrNotFound(res sql.Result) error {
 	n, err := res.RowsAffected()
@@ -329,7 +386,7 @@ func (s *SQLiteDB) SaveMessage(ctx context.Context, msg *models.ChatMessage) (bo
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (from_peer_id, id) DO NOTHING`,
 		msg.ID, msg.From, nullString(msg.To), nullString(msg.GroupID),
-		msg.Message, string(msg.Type), ms(msg.Timestamp), boolInt(msg.Delivered), boolInt(msg.Read))
+		s.seal(aadMessage(msg.From, msg.ID), msg.Message), string(msg.Type), ms(msg.Timestamp), boolInt(msg.Delivered), boolInt(msg.Read))
 	if err != nil {
 		return false, fmt.Errorf("failed to save message: %w", err)
 	}
@@ -386,9 +443,45 @@ var likeEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
 // SearchMessages searches for messages containing specific text
 func (s *SQLiteDB) SearchMessages(ctx context.Context, query string, p Page) ([]*models.ChatMessage, error) {
 	p = p.normalized()
+	if s.vault != nil {
+		return s.searchEncrypted(ctx, query, p)
+	}
 	return s.queryMessages(ctx, `SELECT `+messageColumns+` FROM messages
 		WHERE deleted_at IS NULL AND content LIKE ? ESCAPE '\' AND (? = 0 OR seq < ?)
 		ORDER BY seq DESC LIMIT ?`, "%"+likeEscaper.Replace(query)+"%", p.Before, p.Before, p.Limit)
+}
+
+// maxSearchScan bounds how many messages an encrypted search will decrypt.
+const maxSearchScan = 100_000
+
+// searchEncrypted searches by decrypting newest-first in batches: the database
+// cannot match text it cannot read. Results are the same as the LIKE search.
+func (s *SQLiteDB) searchEncrypted(ctx context.Context, query string, p Page) ([]*models.ChatMessage, error) {
+	needle := strings.ToLower(query)
+	var out []*models.ChatMessage
+	before, scanned := p.Before, 0
+	for scanned < maxSearchScan {
+		if err := ctx.Err(); err != nil {
+			return out, err
+		}
+		batch, err := s.GetMessages(ctx, Page{Limit: maxPageSize, Before: before})
+		if err != nil {
+			return nil, err
+		}
+		if len(batch) == 0 {
+			break
+		}
+		for _, m := range batch {
+			scanned++
+			if strings.Contains(strings.ToLower(m.Message), needle) {
+				if out = append(out, m); len(out) == p.Limit {
+					return out, nil
+				}
+			}
+		}
+		before = batch[len(batch)-1].Seq
+	}
+	return out, nil
 }
 
 func (s *SQLiteDB) queryMessages(ctx context.Context, query string, args ...any) ([]*models.ChatMessage, error) {
@@ -407,6 +500,10 @@ func (s *SQLiteDB) queryMessages(ctx context.Context, query string, args ...any)
 		if err := rows.Scan(&msg.Seq, &msg.ID, &msg.From, &msg.To, &msg.GroupID, &msg.Message,
 			&msgType, &createdAt, &delivered, &read); err != nil {
 			return nil, fmt.Errorf("failed to scan message: %w", err)
+		}
+		var err error
+		if msg.Message, err = s.open(aadMessage(msg.From, msg.ID), msg.Message); err != nil {
+			return nil, err
 		}
 		msg.Type = models.MessageType(msgType)
 		msg.Timestamp = fromMs(createdAt)
@@ -462,11 +559,17 @@ type querier interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
-const upsertMember = `INSERT INTO group_members (group_id, peer_id, username, joined_at, role, is_active)
+const upsertMemberSQL = `INSERT INTO group_members (group_id, peer_id, username, joined_at, role, is_active)
 	VALUES (?, ?, ?, ?, ?, 1)
 	ON CONFLICT (group_id, peer_id) DO UPDATE SET
 		username = excluded.username, joined_at = excluded.joined_at,
 		role = excluded.role, is_active = 1`
+
+// upsertMember adds or re-activates a member, sealing the display name.
+func (s *SQLiteDB) upsertMember(ctx context.Context, q querier, groupID, peerID, username string, joinedAt int64, role string) error {
+	_, err := q.ExecContext(ctx, upsertMemberSQL, groupID, peerID, s.seal(aadMember(groupID, peerID), username), joinedAt, role)
+	return err
+}
 
 // CreateGroup atomically creates a group with its initial members
 func (s *SQLiteDB) CreateGroup(ctx context.Context, group *models.Group) error {
@@ -481,7 +584,7 @@ func (s *SQLiteDB) CreateGroup(ctx context.Context, group *models.Group) error {
 
 	if _, err := tx.ExecContext(ctx, `INSERT INTO groups (id, name, description, created_by, created_at, updated_at, is_active)
 		VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		group.ID, group.Name, group.Description, group.CreatedBy,
+		group.ID, s.seal(aadGroup("name", group.ID), group.Name), s.seal(aadGroup("description", group.ID), group.Description), group.CreatedBy,
 		ms(group.CreatedAt), ms(group.UpdatedAt), boolInt(group.IsActive)); err != nil {
 		return fmt.Errorf("failed to create group: %w", err)
 	}
@@ -490,18 +593,25 @@ func (s *SQLiteDB) CreateGroup(ctx context.Context, group *models.Group) error {
 		if peerID == group.CreatedBy {
 			role = models.RoleAdmin
 		}
-		if _, err := tx.ExecContext(ctx, upsertMember, group.ID, peerID, username, ms(group.CreatedAt), role); err != nil {
+		if err := s.upsertMember(ctx, tx, group.ID, peerID, username, ms(group.CreatedAt), role); err != nil {
 			return fmt.Errorf("failed to add group member: %w", err)
 		}
 	}
 	return tx.Commit()
 }
 
-func scanGroup(sc interface{ Scan(...any) error }) (*models.Group, error) {
+func (s *SQLiteDB) scanGroup(sc interface{ Scan(...any) error }) (*models.Group, error) {
 	g := &models.Group{Members: make(map[string]string)}
 	var created, updated int64
 	var active int
 	if err := sc.Scan(&g.ID, &g.Name, &g.Description, &g.CreatedBy, &created, &updated, &active); err != nil {
+		return nil, err
+	}
+	var err error
+	if g.Name, err = s.open(aadGroup("name", g.ID), g.Name); err != nil {
+		return nil, err
+	}
+	if g.Description, err = s.open(aadGroup("description", g.ID), g.Description); err != nil {
 		return nil, err
 	}
 	g.CreatedAt, g.UpdatedAt, g.IsActive = fromMs(created), fromMs(updated), active != 0
@@ -512,11 +622,11 @@ const groupColumns = `g.id, g.name, g.description, g.created_by, g.created_at, g
 
 // GetGroup retrieves an active group and its active members
 func (s *SQLiteDB) GetGroup(ctx context.Context, groupID string) (*models.Group, error) {
-	return getGroup(ctx, s.db, groupID)
+	return s.getGroup(ctx, s.db, groupID)
 }
 
-func getGroup(ctx context.Context, q querier, groupID string) (*models.Group, error) {
-	g, err := scanGroup(q.QueryRowContext(ctx,
+func (s *SQLiteDB) getGroup(ctx context.Context, q querier, groupID string) (*models.Group, error) {
+	g, err := s.scanGroup(q.QueryRowContext(ctx,
 		`SELECT `+groupColumns+` FROM groups g WHERE g.id = ? AND g.is_active = 1`, groupID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
@@ -524,7 +634,7 @@ func getGroup(ctx context.Context, q querier, groupID string) (*models.Group, er
 	if err != nil {
 		return nil, fmt.Errorf("failed to get group: %w", err)
 	}
-	members, err := getGroupMembers(ctx, q, groupID)
+	members, err := s.getGroupMembers(ctx, q, groupID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load group members: %w", err)
 	}
@@ -548,7 +658,7 @@ func (s *SQLiteDB) GetGroupsByMember(ctx context.Context, peerID string) ([]*mod
 
 	var groups []*models.Group
 	for rows.Next() {
-		g, err := scanGroup(rows)
+		g, err := s.scanGroup(rows)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan group: %w", err)
 		}
@@ -564,7 +674,7 @@ func (s *SQLiteDB) GetGroupsByMember(ctx context.Context, peerID string) ([]*mod
 func (s *SQLiteDB) UpdateGroup(ctx context.Context, group *models.Group) error {
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE groups SET name = ?, description = ?, updated_at = ? WHERE id = ? AND is_active = 1`,
-		group.Name, group.Description, ms(time.Now()), group.ID)
+		s.seal(aadGroup("name", group.ID), group.Name), s.seal(aadGroup("description", group.ID), group.Description), ms(time.Now()), group.ID)
 	if err != nil {
 		return fmt.Errorf("failed to update group: %w", err)
 	}
@@ -582,7 +692,7 @@ func (s *SQLiteDB) DeleteGroup(ctx context.Context, groupID string) error {
 
 // AddGroupMember adds (or re-activates) a member
 func (s *SQLiteDB) AddGroupMember(ctx context.Context, m *models.GroupMember) error {
-	if _, err := s.db.ExecContext(ctx, upsertMember, m.GroupID, m.PeerID, m.Username, ms(m.JoinedAt), m.Role); err != nil {
+	if err := s.upsertMember(ctx, s.db, m.GroupID, m.PeerID, m.Username, ms(m.JoinedAt), m.Role); err != nil {
 		return fmt.Errorf("failed to add group member: %w", err)
 	}
 	return nil
@@ -600,10 +710,10 @@ func (s *SQLiteDB) RemoveGroupMember(ctx context.Context, groupID, peerID string
 
 // GetGroupMembers retrieves the active members of a group
 func (s *SQLiteDB) GetGroupMembers(ctx context.Context, groupID string) ([]*models.GroupMember, error) {
-	return getGroupMembers(ctx, s.db, groupID)
+	return s.getGroupMembers(ctx, s.db, groupID)
 }
 
-func getGroupMembers(ctx context.Context, q querier, groupID string) ([]*models.GroupMember, error) {
+func (s *SQLiteDB) getGroupMembers(ctx context.Context, q querier, groupID string) ([]*models.GroupMember, error) {
 	rows, err := q.QueryContext(ctx, `SELECT group_id, peer_id, username, joined_at, role, is_active
 		FROM group_members WHERE group_id = ? AND is_active = 1 ORDER BY joined_at, peer_id`, groupID)
 	if err != nil {
@@ -618,6 +728,10 @@ func getGroupMembers(ctx context.Context, q querier, groupID string) ([]*models.
 		var active int
 		if err := rows.Scan(&m.GroupID, &m.PeerID, &m.Username, &joined, &m.Role, &active); err != nil {
 			return nil, fmt.Errorf("failed to scan group member: %w", err)
+		}
+		var err error
+		if m.Username, err = s.open(aadMember(m.GroupID, m.PeerID), m.Username); err != nil {
+			return nil, err
 		}
 		m.JoinedAt, m.IsActive = fromMs(joined), active != 0
 		members = append(members, m)
@@ -655,20 +769,31 @@ func (s *SQLiteDB) CreateInvite(ctx context.Context, inv *models.GroupInvite) er
 	}
 	_, err = s.db.ExecContext(ctx, `INSERT INTO group_invites (`+inviteColumns+`)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		inv.ID, inv.GroupID, inv.GroupName, inv.GroupDescription, inv.GroupCreator, inv.InviterID, inv.InviteeID,
-		ms(inv.CreatedAt), ms(inv.ExpiresAt), inv.Status, string(members))
+		inv.ID, inv.GroupID, s.seal(aadInvite("group_name", inv.ID), inv.GroupName),
+		s.seal(aadInvite("group_description", inv.ID), inv.GroupDescription), inv.GroupCreator, inv.InviterID, inv.InviteeID,
+		ms(inv.CreatedAt), ms(inv.ExpiresAt), inv.Status, s.seal(aadInvite("members", inv.ID), string(members)))
 	if err != nil {
 		return fmt.Errorf("failed to create invite: %w", err)
 	}
 	return nil
 }
 
-func scanInvite(sc interface{ Scan(...any) error }) (*models.GroupInvite, error) {
+func (s *SQLiteDB) scanInvite(sc interface{ Scan(...any) error }) (*models.GroupInvite, error) {
 	inv := &models.GroupInvite{}
 	var created, expires int64
 	var members string
 	if err := sc.Scan(&inv.ID, &inv.GroupID, &inv.GroupName, &inv.GroupDescription, &inv.GroupCreator,
 		&inv.InviterID, &inv.InviteeID, &created, &expires, &inv.Status, &members); err != nil {
+		return nil, err
+	}
+	var err error
+	if inv.GroupName, err = s.open(aadInvite("group_name", inv.ID), inv.GroupName); err != nil {
+		return nil, err
+	}
+	if inv.GroupDescription, err = s.open(aadInvite("group_description", inv.ID), inv.GroupDescription); err != nil {
+		return nil, err
+	}
+	if members, err = s.open(aadInvite("members", inv.ID), members); err != nil {
 		return nil, err
 	}
 	inv.CreatedAt, inv.ExpiresAt = fromMs(created), fromMs(expires)
@@ -680,7 +805,7 @@ func scanInvite(sc interface{ Scan(...any) error }) (*models.GroupInvite, error)
 
 // GetInvite retrieves an invitation by ID
 func (s *SQLiteDB) GetInvite(ctx context.Context, inviteID string) (*models.GroupInvite, error) {
-	inv, err := scanInvite(s.db.QueryRowContext(ctx,
+	inv, err := s.scanInvite(s.db.QueryRowContext(ctx,
 		`SELECT `+inviteColumns+` FROM group_invites WHERE id = ?`, inviteID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
@@ -712,7 +837,7 @@ func (s *SQLiteDB) queryInvites(ctx context.Context, query string, args ...any) 
 
 	var invites []*models.GroupInvite
 	for rows.Next() {
-		inv, err := scanInvite(rows)
+		inv, err := s.scanInvite(rows)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan invite: %w", err)
 		}
@@ -772,7 +897,7 @@ func (s *SQLiteDB) AcceptInvite(ctx context.Context, inviteID, inviteeID, invite
 	}
 	defer tx.Rollback()
 
-	inv, err := scanInvite(tx.QueryRowContext(ctx, `SELECT `+inviteColumns+` FROM group_invites WHERE id = ?`, inviteID))
+	inv, err := s.scanInvite(tx.QueryRowContext(ctx, `SELECT `+inviteColumns+` FROM group_invites WHERE id = ?`, inviteID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -787,7 +912,8 @@ func (s *SQLiteDB) AcceptInvite(ctx context.Context, inviteID, inviteeID, invite
 		VALUES (?, ?, ?, ?, ?, ?, 1)
 		ON CONFLICT (id) DO UPDATE SET name = excluded.name, description = excluded.description,
 			updated_at = excluded.updated_at, is_active = 1`,
-		inv.GroupID, inv.GroupName, inv.GroupDescription, inv.GroupCreator, ms(now), ms(now)); err != nil {
+		inv.GroupID, s.seal(aadGroup("name", inv.GroupID), inv.GroupName), s.seal(aadGroup("description", inv.GroupID), inv.GroupDescription),
+		inv.GroupCreator, ms(now), ms(now)); err != nil {
 		return nil, fmt.Errorf("failed to create group: %w", err)
 	}
 	// Start from a clean slate so members that left while we were away do
@@ -800,19 +926,19 @@ func (s *SQLiteDB) AcceptInvite(ctx context.Context, inviteID, inviteeID, invite
 		if m.PeerID == inv.GroupCreator {
 			role = models.RoleAdmin
 		}
-		if _, err := tx.ExecContext(ctx, upsertMember, inv.GroupID, m.PeerID, m.Username, ms(now), role); err != nil {
+		if err := s.upsertMember(ctx, tx, inv.GroupID, m.PeerID, m.Username, ms(now), role); err != nil {
 			return nil, fmt.Errorf("failed to add member: %w", err)
 		}
 	}
 	// The invitee's own display name is not in the inviter's snapshot.
-	if _, err := tx.ExecContext(ctx, upsertMember, inv.GroupID, inviteeID, inviteeName, ms(now), models.RoleMember); err != nil {
+	if err := s.upsertMember(ctx, tx, inv.GroupID, inviteeID, inviteeName, ms(now), models.RoleMember); err != nil {
 		return nil, fmt.Errorf("failed to add invitee: %w", err)
 	}
 
 	if _, err := tx.ExecContext(ctx, `UPDATE group_invites SET status = 'accepted' WHERE id = ?`, inv.ID); err != nil {
 		return nil, fmt.Errorf("failed to update invite: %w", err)
 	}
-	g, err := getGroup(ctx, tx, inv.GroupID)
+	g, err := s.getGroup(ctx, tx, inv.GroupID)
 	if err != nil {
 		return nil, err
 	}
